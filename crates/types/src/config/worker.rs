@@ -364,6 +364,13 @@ pub struct InvokerOptions {
     ///
     /// Number of concurrent invocations that can be processed by the invoker.
     concurrent_invocations_limit: Option<NonZeroUsize>,
+    /// # Chain admission
+    ///
+    /// Automatic admission control per root service: how many *chains* (a root
+    /// invocation plus everything it calls) may be in progress at once is
+    /// learned from the chains' own end-to-end latency (Gradient2), without any
+    /// rule. Weights (`restate rules set --weight`) keep deciding priority.
+    pub chain_admission: ChainAdmissionOptions,
 
     /// # Eager state size limit (since v1.7.0)
     ///
@@ -587,6 +594,56 @@ impl InvokerOptions {
     }
 }
 
+/// # Chain admission options
+#[serde_as]
+#[derive(Debug, Clone, Serialize, Deserialize, derive_builder::Builder)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schemars", schemars(rename = "ChainAdmissionOptions", default))]
+#[serde(rename_all = "kebab-case", default)]
+#[builder(default)]
+pub struct ChainAdmissionOptions {
+    /// # Enabled
+    ///
+    /// Gate root invocations on their root service's learned chain limit.
+    pub enabled: bool,
+    /// # Minimum chains in progress
+    ///
+    /// Per partition. The limit never drops below this, so samples keep flowing.
+    pub min: NonZeroU32,
+    /// # Maximum chains in progress
+    ///
+    /// Per partition. Unset: the invoker's `concurrent-invocations-limit`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max: Option<NonZeroU32>,
+    /// # Tolerance (permille)
+    ///
+    /// How much slower than the long-term baseline a chain may run before the
+    /// limit shrinks. 1500 = 50% slower is still acceptable.
+    pub tolerance_permille: NonZeroU32,
+    /// # Smoothing (permille)
+    ///
+    /// Fraction of a computed limit change applied per update.
+    pub smoothing_permille: NonZeroU32,
+    /// # Sample cutoff
+    ///
+    /// Chains whose active time exceeds this are released but not used as a
+    /// latency sample.
+    pub sample_max: FriendlyDuration,
+}
+
+impl Default for ChainAdmissionOptions {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min: NonZeroU32::new(4).expect("is non zero"),
+            max: None,
+            tolerance_permille: NonZeroU32::new(1500).expect("is non zero"),
+            smoothing_permille: NonZeroU32::new(200).expect("is non zero"),
+            sample_max: FriendlyDuration::new(Duration::from_secs(60)),
+        }
+    }
+}
+
 impl Default for InvokerOptions {
     fn default() -> Self {
         Self {
@@ -599,6 +656,7 @@ impl Default for InvokerOptions {
             message_size_limit: None,
             tmp_dir: None,
             concurrent_invocations_limit: Some(NonZeroUsize::new(1000).expect("is non zero")),
+            chain_admission: ChainAdmissionOptions::default(),
             eager_state_size_limit: None,
             disable_eager_state: false,
             invocation_throttling: None,

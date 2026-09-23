@@ -21,7 +21,7 @@ use restate_storage_api::vqueue_table::scheduler::{RunAction, SchedulerAction, Y
 use restate_storage_api::vqueue_table::{EntryKey, EntryMetadata, ScanVQueueTable, VQueueStore};
 use restate_types::identifiers::PartitionKey;
 use restate_types::vqueues::VQueueId;
-use restate_worker_api::resources::ReservedResources;
+use restate_worker_api::resources::{ChainSignal, ReservedResources};
 use restate_worker_api::{SchedulingStatus, UserLimitCounterEntry, VQueueSchedulerStatus};
 
 use crate::cache::VQueueHandle;
@@ -42,7 +42,7 @@ mod vqueue_state;
 
 // Re-exports
 pub use eligible::{SchedulingGroup, WeightResolver};
-pub use resource_manager::ResourceManager;
+pub use resource_manager::{ChainAdmissionConfig, ControllerParams, ResourceManager};
 
 /// Live map of scope name → scheduling weight, fed from scope-level exact rules
 /// (`restate rules set <scope> --weight N`). Shared between the scheduler service
@@ -300,6 +300,14 @@ impl<S: VQueueStore> SchedulerService<S> {
         apply_rule_updates_to_service_weights(&self.service_weights, &updates);
         if let State::Active(ref drr_scheduler) = self.state {
             drr_scheduler.on_rules_updated(updates);
+        }
+    }
+
+    /// Forward a chain lifecycle signal to the embedded resource manager.
+    /// No-op when the scheduler is disabled (followers).
+    pub fn on_chain_signal(&self, signal: ChainSignal) {
+        if let State::Active(ref drr_scheduler) = self.state {
+            drr_scheduler.on_chain_signal(signal);
         }
     }
 

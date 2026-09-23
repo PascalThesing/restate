@@ -877,6 +877,9 @@ impl LeaderState {
             Action::RulesUpdated(updates) => {
                 self.scheduler.on_rules_updated(updates);
             }
+            Action::ChainSignal(signal) => {
+                self.scheduler.on_chain_signal(signal);
+            }
         }
 
         Ok(())

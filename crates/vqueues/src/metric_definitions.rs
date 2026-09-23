@@ -48,7 +48,57 @@ pub const ADAPTIVE_DRIFT_DECAY_TOTAL: &str =
 pub const ADAPTIVE_SAMPLES_TOTAL: &str = "restate.limiter.concurrency.adaptive.samples.total";
 pub const HOLD_TIME_SECONDS: &str = "restate.limiter.hold_time.seconds";
 
+// -- Chain admission (automatic Gradient2 per root service) -----------------
+// Labels: `root` (the root service name) and `partition_id`.
+pub const CHAIN_LIMIT: &str = "restate.chain_admission.limit";
+pub const CHAIN_IN_PROGRESS: &str = "restate.chain_admission.in_progress";
+pub const CHAIN_GRADIENT: &str = "restate.chain_admission.gradient";
+pub const CHAIN_SHORT_RTT_MS: &str = "restate.chain_admission.short_rtt_ms";
+pub const CHAIN_LONG_RTT_MS: &str = "restate.chain_admission.long_rtt_ms";
+pub const CHAIN_SOJOURN_MIN_MS: &str = "restate.chain_admission.sojourn_min_ms";
+pub const CHAIN_UPDATES_TOTAL: &str = "restate.chain_admission.updates.total";
+pub const CHAIN_BACKSTOP_TOTAL: &str = "restate.chain_admission.backstop.total";
+pub const CHAIN_DRIFT_DECAY_TOTAL: &str = "restate.chain_admission.drift_decay.total";
+pub const CHAIN_SAMPLES_TOTAL: &str = "restate.chain_admission.samples.total";
+pub const CHAIN_ACTIVE_TIME_SECONDS: &str = "restate.chain_admission.active_time.seconds";
+pub const CHAIN_WAITERS: &str = "restate.chain_admission.waiters";
+
 pub fn describe_metrics() {
+    describe_gauge!(
+        CHAIN_LIMIT,
+        Unit::Count,
+        "Chain admission: learned limit of chains in progress per root service and partition"
+    );
+    describe_gauge!(
+        CHAIN_IN_PROGRESS,
+        Unit::Count,
+        "Chain admission: chains currently holding a permit per root service and partition"
+    );
+    describe_gauge!(
+        CHAIN_WAITERS,
+        Unit::Count,
+        "Chain admission: queues parked waiting for a chain permit"
+    );
+    describe_histogram!(
+        CHAIN_ACTIVE_TIME_SECONDS,
+        Unit::Seconds,
+        "Chain admission: active end-to-end time of completed chains (external waits excluded)"
+    );
+    describe_counter!(
+        CHAIN_SAMPLES_TOTAL,
+        Unit::Count,
+        "Chain admission: latency samples fed to the controller"
+    );
+    describe_counter!(
+        CHAIN_UPDATES_TOTAL,
+        Unit::Count,
+        "Chain admission: controller updates by outcome"
+    );
+    describe_counter!(
+        CHAIN_BACKSTOP_TOTAL,
+        Unit::Count,
+        "Chain admission: sojourn backstop actions (freeze/trim)"
+    );
     describe_counter!(
         VQUEUE_ENQUEUE,
         Unit::Count,

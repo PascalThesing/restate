@@ -18,7 +18,8 @@ use restate_futures_util::concurrency::Permit;
 use restate_limiter::LimitKey;
 use restate_memory::MemoryLease;
 use restate_storage_api::vqueue_table::EntryMetadata;
-use restate_types::Scope;
+use restate_types::vqueues::EntryId;
+use restate_types::{Scope, ServiceName};
 use restate_util_string::ReString;
 
 // Re-export so consumers can keep importing from `restate_worker_api::resources`.
@@ -37,6 +38,36 @@ pub enum ResourceManagerUpdate {
     /// than a single `RuleUpdate` so initial seeding and bulk rule-book
     /// diffs can ship as one channel message.
     RulesUpdated(Box<[RuleUpdate]>),
+    /// Leader-side chain lifecycle signal (see [`ChainSignal`]).
+    ChainSignal(ChainSignal),
+}
+
+/// Lifecycle signal for chain admission. A *chain* is a root invocation
+/// (one that no other invocation called) together with everything it
+/// calls. The partition leader emits these from the state machine; the
+/// scheduler turns them into chain permits and the end-to-end latency
+/// samples that drive automatic admission control.
+#[derive(Debug, Clone)]
+pub struct ChainSignal {
+    pub entry_id: EntryId,
+    pub kind: ChainSignalKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum ChainSignalKind {
+    /// A root invocation was enqueued for its first run: it needs a chain
+    /// permit before it may start.
+    NewStart { root: ServiceName },
+    /// The root suspended on an external future (awakeable, sleep, promise,
+    /// signal): the chain consumes nothing downstream, so its permit is
+    /// released and its clock paused.
+    Pause,
+    /// The root is back in the inbox after an external wait: it needs a chain
+    /// permit again, ahead of new starts.
+    ResumeExternal,
+    /// The root reached a terminal state. `completed` selects whether the
+    /// chain's active time becomes a latency sample.
+    End { completed: bool },
 }
 
 pub enum UserPermitKind {

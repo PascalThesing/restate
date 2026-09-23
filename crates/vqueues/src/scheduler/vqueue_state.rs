@@ -130,6 +130,8 @@ impl WaitBucket {
             ResourceKind::InvokerMemory => WaitBucket::InvokerMemory,
             ResourceKind::InvokerThrottling { .. } => WaitBucket::InvokerThrottling,
             ResourceKind::DeploymentConcurrency => WaitBucket::DeploymentConcurrency,
+            // a chain permit is an admission rule wait, not invoker capacity
+            ResourceKind::ChainAdmission { .. } => WaitBucket::ConcurrencyRules,
         }
     }
 }

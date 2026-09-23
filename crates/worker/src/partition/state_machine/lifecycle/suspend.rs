@@ -21,12 +21,14 @@ use restate_storage_api::vqueue_table::{EntryStatusHeader, ReadVQueueTable, Writ
 use restate_types::identifiers::{InvocationId, WithPartitionKey};
 use restate_types::journal_events::raw::RawEvent;
 use restate_types::journal_events::{Event, SuspendedEvent};
-use restate_types::journal_v2::UnresolvedFuture;
+use restate_types::invocation::Source;
+use restate_types::journal_v2::{CommandType, NotificationId, UnresolvedFuture};
+use restate_worker_api::resources::{ChainSignal, ChainSignalKind};
 use restate_types::vqueues::EntryId;
 use restate_vqueues::VQueue;
 
 use crate::partition::state_machine::lifecycle::event::ApplyEventCommand;
-use crate::partition::state_machine::{CommandHandler, Error, StateMachineApplyContext};
+use crate::partition::state_machine::{Action, CommandHandler, Error, StateMachineApplyContext};
 
 pub struct OnSuspendCommand {
     pub invocation_id: InvocationId,
@@ -132,6 +134,19 @@ where
                 .await?
                 .expect("suspending in a non-existent vqueue")
                 .suspend_entry(now, &header);
+
+                // Chain admission: a root waiting on an external future (no
+                // pending call among the awaited futures) consumes nothing
+                // downstream — release its chain permit and pause its clock.
+                if ctx.is_leader
+                    && !matches!(in_flight_invocation_metadata.source, Source::Service(..))
+                    && !awaits_a_call(ctx, self.invocation_id, &self.awaiting_on).await?
+                {
+                    ctx.action_collector.push(Action::ChainSignal(ChainSignal {
+                        entry_id,
+                        kind: ChainSignalKind::Pause,
+                    }));
+                }
             }
 
             invocation_status = InvocationStatus::Suspended {
@@ -145,6 +160,29 @@ where
             .put_invocation_status(&self.invocation_id, &invocation_status)
             .map_err(Error::Storage)
     }
+}
+
+/// True when any awaited future is the result of a `Call` command — the
+/// root is then waiting on its own chain, not on the outside world.
+async fn awaits_a_call<S: ReadJournalTable>(
+    ctx: &mut StateMachineApplyContext<'_, S>,
+    invocation_id: InvocationId,
+    awaiting_on: &UnresolvedFuture,
+) -> Result<bool, Error> {
+    for notification_id in awaiting_on.flatten() {
+        let NotificationId::CompletionId(completion_id) = notification_id else {
+            continue;
+        };
+        if let Some((_, command)) = ctx
+            .storage
+            .get_command_by_completion_id(invocation_id, completion_id)
+            .await?
+            && command.command_type() == CommandType::Call
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]

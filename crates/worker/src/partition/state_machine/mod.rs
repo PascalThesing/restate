@@ -65,6 +65,8 @@ use restate_storage_api::timer_table::TimerKey;
 use restate_storage_api::timer_table::{Timer, WriteTimerTable};
 use restate_storage_api::vqueue_table::scheduler::{self, YieldReason};
 use restate_storage_api::vqueue_table::{self, EntryKey, Stage};
+use restate_types::ServiceName;
+use restate_worker_api::resources::{ChainSignal, ChainSignalKind};
 use restate_storage_api::vqueue_table::{EntryStatusHeader, ReadVQueueTable, WriteVQueueTable};
 use restate_storage_api::{Result as StorageResult, journal_table};
 use restate_storage_api::{StorageError, journal_table_v2};
@@ -1209,6 +1211,16 @@ impl<S> StateMachineApplyContext<'_, S> {
             .vqueue_id
             .as_ref()
             .expect("invariant violation: vqueue id must be set");
+        // A root (no calling invocation) starts a chain: tell the scheduler
+        // before the enqueue event so the entry is gated on its first run.
+        if self.is_leader && !matches!(metadata.source, Source::Service(..)) {
+            self.action_collector.push(Action::ChainSignal(ChainSignal {
+                entry_id: EntryId::from(invocation_id),
+                kind: ChainSignalKind::NewStart {
+                    root: ServiceName::new(metadata.invocation_target.service_name()),
+                },
+            }));
+        }
         VQueue::vqueue_from_invocation_target(
             record_unique_ts,
             qid,
@@ -2094,6 +2106,7 @@ impl<S> StateMachineApplyContext<'_, S> {
                 .await?
                 .expect("terminate expects vqueue to exist")
                 .end(record_unique_ts, &entry_status, new_status, Duration::ZERO);
+                self.emit_chain_end(invocation_id, false);
             }
         } else {
             // Delete inbox entry and invocation status.
@@ -2204,6 +2217,7 @@ impl<S> StateMachineApplyContext<'_, S> {
                 .await?
                 .expect("terminate expects vqueue to exist")
                 .end(record_unique_ts, &entry_status, new_status, Duration::ZERO);
+                self.emit_chain_end(invocation_id, false);
             }
         } else {
             // Delete timer
@@ -3133,6 +3147,10 @@ impl<S> StateMachineApplyContext<'_, S> {
                 &entry_status,
                 end_status,
                 completion_retention,
+            );
+            self.emit_chain_end(
+                invocation_id,
+                matches!(end_status, vqueue_table::Status::Succeeded),
             );
         } else {
             // Consume inbox and move on
@@ -5614,6 +5632,17 @@ impl<S> StateMachineApplyContext<'_, S> {
         vqueue.reschedule(&header, run_at, pinned_deployment);
 
         Ok(is_waiting)
+    }
+
+    /// Chain admission: a root reached a terminal state. Cheap for children —
+    /// the scheduler ignores entries it never admitted.
+    fn emit_chain_end(&mut self, invocation_id: InvocationId, completed: bool) {
+        if self.is_leader {
+            self.action_collector.push(Action::ChainSignal(ChainSignal {
+                entry_id: EntryId::from(&invocation_id),
+                kind: ChainSignalKind::End { completed },
+            }));
+        }
     }
 
     async fn vqueue_enqueue_state_mutation(

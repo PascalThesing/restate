@@ -486,6 +486,26 @@ where
             let lane_weight_resolver =
                 restate_vqueues::lane_weight_resolver(service_weights.clone());
 
+            let chain_config = {
+                let invoker_opts = &Configuration::pinned().worker.invoker;
+                let opts = &invoker_opts.chain_admission;
+                restate_vqueues::ChainAdmissionConfig {
+                    enabled: opts.enabled,
+                    params: restate_vqueues::ControllerParams {
+                        min: opts.min.get(),
+                        max: opts.max.map(|m| m.get()).unwrap_or_else(|| {
+                            invoker_opts
+                                .concurrent_invocations_limit()
+                                .map(|l| l.get().min(u32::MAX as usize) as u32)
+                                .unwrap_or(u32::MAX)
+                        }),
+                        tolerance_permille: opts.tolerance_permille.get(),
+                        smoothing_permille: opts.smoothing_permille.get(),
+                        initial: None,
+                    },
+                    sample_max: opts.sample_max.into(),
+                }
+            };
             let scheduler_service = SchedulerService::create(
                 ResourceManager::create(
                     partition_store.partition_db().clone(),
@@ -496,6 +516,7 @@ where
                     weight_resolver.clone(),
                     lane_weight_resolver,
                     self.partition.partition_id.to_string(),
+                    chain_config,
                 )
                 .await?,
                 partition_store.partition_db().clone(),

@@ -28,6 +28,7 @@ pub(super) fn test_grouped_waiters(
         ),
     )
 }
+mod chain_admission;
 mod gradient2;
 mod invoker_memory;
 mod invoker_throttle;
@@ -35,6 +36,8 @@ mod locks;
 mod permit;
 mod user_limiter;
 
+pub use self::chain_admission::ChainAdmissionConfig;
+pub use self::gradient2::ControllerParams;
 pub use self::permit::PermitBuilder;
 
 use std::collections::VecDeque;
@@ -55,9 +58,10 @@ use restate_types::identifiers::PartitionKey;
 use restate_types::vqueues::EntryKind;
 use restate_types::{LockName, Scope};
 use restate_util_string::ReString;
-use restate_worker_api::resources::{ResourceManagerUpdate, UserPermitKind};
+use restate_worker_api::resources::{ChainSignal, ResourceManagerUpdate, UserPermitKind};
 use restate_worker_api::{ResourceKind, UserLimitCounterEntry};
 
+use self::chain_admission::{Admit, ChainAdmission};
 use self::invoker::InvokerConcurrencyLimiter;
 use self::invoker_memory::InvokerMemoryLimiter;
 use self::invoker_throttle::{InvokerThrottlingLimiter, ThrottlingAcquire};
@@ -79,6 +83,7 @@ pub struct ResourceManager {
     invoker_throttling: InvokerThrottlingLimiter,
     invoker_memory: InvokerMemoryLimiter,
     user_limiter: UserLimiter,
+    chain: ChainAdmission,
     rx: mpsc::UnboundedReceiver<ResourceManagerUpdate>,
     // We need to keep this alive to:
     // - Keep the receiver alive even if we don't have any resource permits handed out
@@ -100,6 +105,7 @@ impl ResourceManager {
         weight_resolver: WeightResolver,
         lane_weight_resolver: LaneWeightResolver,
         partition_label: String,
+        chain_config: ChainAdmissionConfig,
     ) -> Result<Self, StorageError> {
         let locks = Locks::create(storage).await?;
 
@@ -113,7 +119,8 @@ impl ResourceManager {
             ),
             invoker_throttling: InvokerThrottlingLimiter::new(global_throttling),
             invoker_memory: InvokerMemoryLimiter::new(memory_pool, initial_invocation_memory),
-            user_limiter: UserLimiter::create(partition_label),
+            user_limiter: UserLimiter::create(partition_label.clone()),
+            chain: ChainAdmission::new(chain_config, partition_label),
             locks,
             rx,
             tx: _tx,
@@ -127,6 +134,12 @@ impl ResourceManager {
         // Sending via `tx` (which is held alongside `rx` for keep-alive)
         // never fails: the receiver is owned by `self`.
         let _ = self.tx.send(ResourceManagerUpdate::RulesUpdated(updates));
+    }
+
+    /// Forward a chain lifecycle signal; applied on the next `poll_resources`
+    /// tick so waiters can be woken with the eligibility tracker in hand.
+    pub fn on_chain_signal(&self, signal: ChainSignal) {
+        let _ = self.tx.send(ResourceManagerUpdate::ChainSignal(signal));
     }
 
     /// Removes the vqueue from the resource it's blocked on
@@ -153,6 +166,9 @@ impl ResourceManager {
             } => {
                 self.user_limiter
                     .remove_from_waiters(handle, scope, limit_key, *blocked_level);
+            }
+            ResourceKind::ChainAdmission { root } => {
+                self.chain.remove_waiter(handle, root);
             }
         }
     }
@@ -201,6 +217,12 @@ impl ResourceManager {
                 }
             }
         }
+
+        if let Some(entry_id) = permit.chain_entry {
+            let mut woken = Vec::new();
+            self.chain.release_unstarted(entry_id, &mut woken);
+            eligible.wake_up_queues(woken);
+        }
     }
 
     pub(super) fn poll_acquire_permit(
@@ -239,12 +261,32 @@ impl ResourceManager {
                 }
             }
 
+            // Time the head entry has been runnable in the durable queue.
+            let sojourn = restate_clock::RoughTimestamp::now().duration_since(key.run_at());
+
+            // Chain admission: a root invocation needs a chain permit before
+            // its first run (and again after an external wait). Children and
+            // resumes after internal waits are never gated here.
+            if key.kind() == EntryKind::Invocation {
+                match self.chain.poll_admit(
+                    vqueue,
+                    *key.entry_id(),
+                    sojourn,
+                    tokio::time::Instant::now(),
+                ) {
+                    Admit::NotGated => {}
+                    Admit::Admitted => provisional.set_chain_entry(*key.entry_id()),
+                    Admit::Blocked(root) => {
+                        trace!(root = %root, "Chain admission limit reached");
+                        return AcquireOutcome::BlockedOn(ResourceKind::ChainAdmission { root });
+                    }
+                }
+            }
+
             // unscoped entries cannot acquire user limits
             if let Some(scope) = meta.scope() {
-                // Single-lookup path: feeds the acquire-side sojourn (time the
-                // head entry has been runnable in the durable queue) to the
+                // Single-lookup path: feeds the acquire-side sojourn to the
                 // adaptive CoDel backstop AND checks capacity in one trie walk.
-                let sojourn = restate_clock::RoughTimestamp::now().duration_since(key.run_at());
                 let capacity = self.user_limiter.check_concurrency_capacity_observing(
                     scope,
                     meta.limit_key(),
@@ -357,6 +399,10 @@ impl ResourceManager {
                 }
                 ResourceManagerUpdate::RulesUpdated(updates) => {
                     let woken = self.user_limiter.apply_rule_updates(updates);
+                    eligible.wake_up_queues(woken);
+                }
+                ResourceManagerUpdate::ChainSignal(signal) => {
+                    let woken = self.chain.on_signal(signal, tokio::time::Instant::now());
                     eligible.wake_up_queues(woken);
                 }
             }

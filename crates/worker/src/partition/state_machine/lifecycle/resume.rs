@@ -14,6 +14,10 @@ use restate_storage_api::vqueue_table::{ReadVQueueTable, WriteVQueueTable};
 use restate_types::identifiers::InvocationId;
 
 use crate::debug_if_leader;
+use restate_types::invocation::Source;
+use restate_types::vqueues::EntryId;
+use restate_worker_api::resources::{ChainSignal, ChainSignalKind};
+
 use crate::partition::state_machine::{Action, CommandHandler, Error, StateMachineApplyContext};
 
 pub struct ResumeInvocationCommand<'e> {
@@ -41,6 +45,15 @@ where
         metadata.timestamps.update(ctx.record_created_at);
 
         if metadata.vqueue_id.is_some() {
+            // Chain admission: a root coming back after an external wait must
+            // re-acquire its chain permit; after an internal wait this is a
+            // no-op for the scheduler. Emitted before the inbox event.
+            if ctx.is_leader && !matches!(metadata.source, Source::Service(..)) {
+                ctx.action_collector.push(Action::ChainSignal(ChainSignal {
+                    entry_id: EntryId::from(&self.invocation_id),
+                    kind: ChainSignalKind::ResumeExternal,
+                }));
+            }
             ctx.vqueue_move_invocation_to_inbox_stage(&self.invocation_id)
                 .await?;
         } else {

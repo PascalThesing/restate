@@ -28,6 +28,7 @@ use restate_types::identifiers::PartitionKey;
 use restate_types::vqueues::VQueueId;
 use restate_types::{LockName, Scope};
 use restate_worker_api::UserLimitCounterEntry;
+use restate_worker_api::resources::ChainSignal;
 
 use crate::EventDetails;
 use crate::VQueueEvent;
@@ -238,6 +239,10 @@ impl<S: VQueueStore> DRRScheduler<S> {
     /// Forward a batch of rule-book updates to the embedded resource manager.
     pub fn on_rules_updated(&self, updates: Box<[RuleUpdate]>) {
         self.resource_manager.on_rules_updated(updates);
+    }
+
+    pub fn on_chain_signal(&self, signal: ChainSignal) {
+        self.resource_manager.on_chain_signal(signal);
     }
 
     #[tracing::instrument(skip_all)]
@@ -721,6 +726,9 @@ mod tests {
             weight_resolver,
             test_lane_resolver(),
             "test".to_string(),
+            // chain admission stays off in the scheduler tests: they exercise
+            // rules, weights and lanes; chain_admission.rs has its own tests
+            crate::scheduler::ChainAdmissionConfig::default(),
         )
         .await
         .expect("resource manager creation should succeed")

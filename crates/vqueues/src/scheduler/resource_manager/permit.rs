@@ -12,6 +12,7 @@ use smallvec::SmallVec;
 
 use restate_futures_util::concurrency::Permit;
 use restate_storage_api::vqueue_table::EntryMetadata;
+use restate_types::vqueues::EntryId;
 use restate_types::{LockName, Scope};
 use restate_worker_api::resources::{
     ReservedResources, SystemPermit, ThrottlingToken, UserPermitKind,
@@ -86,6 +87,9 @@ pub(super) struct CanonicalLock {
 pub(crate) struct UserPermit {
     pub(super) lock: Option<CanonicalLock>,
     pub(super) resources: SmallVec<[UserPermitKind; 1]>,
+    /// Chain permit taken for this entry (released on revert only — the
+    /// chain permit outlives the run attempt by design).
+    pub(super) chain_entry: Option<EntryId>,
 }
 
 // Use this to stage the resources needed to create a user permit as a transaction
@@ -93,6 +97,7 @@ pub(crate) struct UserPermit {
 pub(crate) struct ProvisionalPermit {
     lock: Option<CanonicalLock>,
     resources: SmallVec<[UserPermitKind; 1]>,
+    chain_entry: Option<EntryId>,
 }
 
 impl ProvisionalPermit {
@@ -103,6 +108,10 @@ impl ProvisionalPermit {
 
     pub(crate) fn set_lock(&mut self, scope: Option<Scope>, lock_name: LockName) {
         self.lock = Some(CanonicalLock { scope, lock_name });
+    }
+
+    pub(crate) fn set_chain_entry(&mut self, entry_id: EntryId) {
+        self.chain_entry = Some(entry_id);
     }
 
     /// Atomically acquires all staged resources. This is the only place where state
@@ -129,6 +138,7 @@ impl ProvisionalPermit {
         UserPermit {
             lock: self.lock,
             resources: self.resources,
+            chain_entry: self.chain_entry,
         }
     }
 }

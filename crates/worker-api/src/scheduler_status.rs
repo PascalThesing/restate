@@ -13,7 +13,7 @@ use restate_limiter::{Level, LimitKey, RuleHandle};
 use restate_storage_api::vqueue_table::stats::WaitStats;
 use restate_types::time::MillisSinceEpoch;
 use restate_types::vqueues::EntryId;
-use restate_types::{LockName, Scope};
+use restate_types::{LockName, Scope, ServiceName};
 use restate_util_string::ReString;
 
 /// A public view of the scheduler's status of a single vqueue.
@@ -111,6 +111,9 @@ pub enum ResourceKind {
         /// May be stale if the rule was removed since blocking.
         blocked_rule: Option<RuleHandle>,
     },
+    /// Waiting for a chain permit: the root service's automatic admission
+    /// limit is fully used by chains in progress.
+    ChainAdmission { root: ServiceName },
 }
 
 impl ResourceKind {
@@ -136,6 +139,9 @@ impl ResourceKind {
             }
             ResourceKind::InvokerMemory => BlockedResource::InvokerMemory,
             ResourceKind::DeploymentConcurrency => BlockedResource::DeploymentConcurrency,
+            ResourceKind::ChainAdmission { root } => BlockedResource::ChainAdmission {
+                root: ReString::new(root.to_string()),
+            },
             ResourceKind::LimitKeyConcurrency {
                 scope,
                 limit_key,
@@ -196,6 +202,8 @@ pub enum BlockedResource {
         /// the rule was removed since the queue became blocked.
         blocked_rule: Option<ReString>,
     },
+    /// Waiting for a chain permit of the given root service.
+    ChainAdmission { root: ReString },
 }
 
 impl std::fmt::Display for BlockedResource {
@@ -212,6 +220,7 @@ impl std::fmt::Display for BlockedResource {
             },
             BlockedResource::InvokerMemory => f.write_str("InvokerMemory"),
             BlockedResource::DeploymentConcurrency => f.write_str("DeploymentConcurrency"),
+            BlockedResource::ChainAdmission { root } => write!(f, "ChainAdmission(root={root})"),
             BlockedResource::LimitKeyConcurrency {
                 scope,
                 limit_key,

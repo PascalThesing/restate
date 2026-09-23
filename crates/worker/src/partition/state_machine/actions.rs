@@ -24,6 +24,7 @@ use restate_types::message::MessageIndex;
 use restate_types::time::MillisSinceEpoch;
 use restate_util_string::ReString;
 use restate_vqueues::{VQueueEvent, VQueueHandle};
+use restate_worker_api::resources::ChainSignal;
 use restate_wal_protocol::timer::TimerKeyValue;
 
 pub type ActionCollector = Vec<Action>;
@@ -32,6 +33,8 @@ pub type ActionCollector = Vec<Action>;
 pub enum Action {
     /// Notifies the scheduler about a vqueue inbox event (e.g, enqueue, run permitted, etc.)
     VQEvent(VQueueEvent),
+    /// Leader-only chain lifecycle signal for the scheduler's chain admission.
+    ChainSignal(ChainSignal),
     /// Tells invoker to run this invocation (similar to Invoke) but carries more information
     VQInvoke {
         vq_handle: VQueueHandle,

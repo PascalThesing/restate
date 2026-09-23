@@ -34,7 +34,76 @@ use restate_limiter::AdaptiveConcurrency;
 use crate::metric_definitions::{
     ADAPTIVE_BACKSTOP_TOTAL, ADAPTIVE_DRIFT_DECAY_TOTAL, ADAPTIVE_GRADIENT, ADAPTIVE_IN_FLIGHT,
     ADAPTIVE_LIMIT, ADAPTIVE_LONG_RTT_MS, ADAPTIVE_SAMPLES_TOTAL, ADAPTIVE_SHORT_RTT_MS,
-    ADAPTIVE_SOJOURN_MIN_MS, ADAPTIVE_UPDATES_TOTAL, HOLD_TIME_SECONDS,
+    ADAPTIVE_SOJOURN_MIN_MS, ADAPTIVE_UPDATES_TOTAL, CHAIN_ACTIVE_TIME_SECONDS,
+    CHAIN_BACKSTOP_TOTAL, CHAIN_DRIFT_DECAY_TOTAL, CHAIN_GRADIENT, CHAIN_IN_PROGRESS,
+    CHAIN_LIMIT, CHAIN_LONG_RTT_MS, CHAIN_SAMPLES_TOTAL, CHAIN_SHORT_RTT_MS,
+    CHAIN_SOJOURN_MIN_MS, CHAIN_UPDATES_TOTAL, HOLD_TIME_SECONDS,
+};
+
+/// Numeric parameters of one controller, independent of what it governs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ControllerParams {
+    pub min: u32,
+    pub max: u32,
+    pub tolerance_permille: u32,
+    pub smoothing_permille: u32,
+    /// Cold-start limit. `None` picks a quarter into the corridor when `max`
+    /// is explicit, else a small multiple of `min`.
+    pub initial: Option<u32>,
+}
+
+/// Which metric family a controller reports into.
+#[derive(Debug, Clone, Copy)]
+pub enum ControllerFamily {
+    /// Per user rule; label `pattern`.
+    Rule,
+    /// Per root service (chain admission); label `root`.
+    Chain,
+}
+
+struct MetricNames {
+    label: &'static str,
+    samples: &'static str,
+    hold_time: &'static str,
+    in_flight: &'static str,
+    limit: &'static str,
+    long_rtt: &'static str,
+    short_rtt: &'static str,
+    gradient: &'static str,
+    sojourn_min: &'static str,
+    drift_decay: &'static str,
+    backstop: &'static str,
+    updates: &'static str,
+}
+
+const RULE_METRICS: MetricNames = MetricNames {
+    label: "pattern",
+    samples: ADAPTIVE_SAMPLES_TOTAL,
+    hold_time: HOLD_TIME_SECONDS,
+    in_flight: ADAPTIVE_IN_FLIGHT,
+    limit: ADAPTIVE_LIMIT,
+    long_rtt: ADAPTIVE_LONG_RTT_MS,
+    short_rtt: ADAPTIVE_SHORT_RTT_MS,
+    gradient: ADAPTIVE_GRADIENT,
+    sojourn_min: ADAPTIVE_SOJOURN_MIN_MS,
+    drift_decay: ADAPTIVE_DRIFT_DECAY_TOTAL,
+    backstop: ADAPTIVE_BACKSTOP_TOTAL,
+    updates: ADAPTIVE_UPDATES_TOTAL,
+};
+
+const CHAIN_METRICS: MetricNames = MetricNames {
+    label: "root",
+    samples: CHAIN_SAMPLES_TOTAL,
+    hold_time: CHAIN_ACTIVE_TIME_SECONDS,
+    in_flight: CHAIN_IN_PROGRESS,
+    limit: CHAIN_LIMIT,
+    long_rtt: CHAIN_LONG_RTT_MS,
+    short_rtt: CHAIN_SHORT_RTT_MS,
+    gradient: CHAIN_GRADIENT,
+    sojourn_min: CHAIN_SOJOURN_MIN_MS,
+    drift_decay: CHAIN_DRIFT_DECAY_TOTAL,
+    backstop: CHAIN_BACKSTOP_TOTAL,
+    updates: CHAIN_UPDATES_TOTAL,
 };
 
 /// Default lower bound: below ~2-4 slots long-running handlers stop producing
@@ -78,9 +147,9 @@ pub enum UpdateOutcome {
 
 pub struct Gradient2Controller {
     // -- configuration ------------------------------------------------------
-    /// The raw rule config; kept so identical re-upserts (helm redeploys)
-    /// preserve the learned state instead of resetting it.
-    cfg: AdaptiveConcurrency,
+    /// Kept so identical re-upserts (helm redeploys) preserve the learned
+    /// state instead of resetting it.
+    params: ControllerParams,
     min: f64,
     max: f64,
     tolerance: f64,
@@ -127,48 +196,62 @@ impl Gradient2Controller {
         partition_label: String,
         now: Instant,
     ) -> Self {
-        let min = cfg.min.map(NonZeroU32::get).unwrap_or(DEFAULT_MIN) as f64;
-        let max = cfg
-            .max
-            .map(NonZeroU32::get)
-            .unwrap_or(DEFAULT_MAX)
-            .max(cfg.min.map(NonZeroU32::get).unwrap_or(DEFAULT_MIN)) as f64;
-        let tolerance = cfg
-            .tolerance_permille
-            .map(NonZeroU32::get)
-            .unwrap_or(DEFAULT_TOLERANCE_PERMILLE) as f64
-            / 1000.0;
-        let smoothing = (cfg
-            .smoothing_permille
-            .map(NonZeroU32::get)
-            .unwrap_or(DEFAULT_SMOOTHING_PERMILLE) as f64
-            / 1000.0)
-            .clamp(0.01, 1.0);
-        // Cold start: with an explicit max, a quarter into the corridor;
-        // without, a small multiple of min.
-        let initial = if cfg.max.is_some() {
-            min + (max - min) / 4.0
-        } else {
-            (min * 8.0).min(max)
+        let min = cfg.min.map(NonZeroU32::get).unwrap_or(DEFAULT_MIN);
+        let params = ControllerParams {
+            min,
+            max: cfg.max.map(NonZeroU32::get).unwrap_or(DEFAULT_MAX).max(min),
+            tolerance_permille: cfg
+                .tolerance_permille
+                .map(NonZeroU32::get)
+                .unwrap_or(DEFAULT_TOLERANCE_PERMILLE),
+            smoothing_permille: cfg
+                .smoothing_permille
+                .map(NonZeroU32::get)
+                .unwrap_or(DEFAULT_SMOOTHING_PERMILLE),
+            initial: cfg.max.map(|max| min + (max.get().max(min) - min) / 4),
         };
-        let outcome_counter = |o: &'static str| counter!(ADAPTIVE_UPDATES_TOTAL, "pattern" => pattern_label.clone(), "partition_id" => partition_label.clone(), "outcome" => o);
+        Self::new(params, ControllerFamily::Rule, pattern_label, partition_label, now)
+    }
+
+    pub fn new(
+        params: ControllerParams,
+        family: ControllerFamily,
+        label: String,
+        partition_label: String,
+        now: Instant,
+    ) -> Self {
+        let names: &'static MetricNames = match family {
+            ControllerFamily::Rule => &RULE_METRICS,
+            ControllerFamily::Chain => &CHAIN_METRICS,
+        };
+        let min = params.min.max(1) as f64;
+        let max = (params.max.max(params.min)) as f64;
+        let tolerance = params.tolerance_permille as f64 / 1000.0;
+        let smoothing = (params.smoothing_permille as f64 / 1000.0).clamp(0.01, 1.0);
+        let initial = params
+            .initial
+            .map(|i| i as f64)
+            .unwrap_or((min * 8.0).min(max))
+            .clamp(min, max);
+        let key = names.label;
+        let outcome_counter = |o: &'static str| counter!(names.updates, key => label.clone(), "partition_id" => partition_label.clone(), "outcome" => o);
         let controller = Self {
-            cfg: cfg.clone(),
+            params,
             min,
             max,
             tolerance,
             smoothing,
-            m_samples: counter!(ADAPTIVE_SAMPLES_TOTAL, "pattern" => pattern_label.clone(), "partition_id" => partition_label.clone()),
-            m_hold_time: histogram!(HOLD_TIME_SECONDS, "pattern" => pattern_label.clone()),
-            m_in_flight: gauge!(ADAPTIVE_IN_FLIGHT, "pattern" => pattern_label.clone(), "partition_id" => partition_label.clone()),
-            m_limit: gauge!(ADAPTIVE_LIMIT, "pattern" => pattern_label.clone(), "partition_id" => partition_label.clone()),
-            m_long_rtt: gauge!(ADAPTIVE_LONG_RTT_MS, "pattern" => pattern_label.clone(), "partition_id" => partition_label.clone()),
-            m_short_rtt: gauge!(ADAPTIVE_SHORT_RTT_MS, "pattern" => pattern_label.clone(), "partition_id" => partition_label.clone()),
-            m_gradient: gauge!(ADAPTIVE_GRADIENT, "pattern" => pattern_label.clone(), "partition_id" => partition_label.clone()),
-            m_sojourn_min: gauge!(ADAPTIVE_SOJOURN_MIN_MS, "pattern" => pattern_label.clone(), "partition_id" => partition_label.clone()),
-            m_drift_decay: counter!(ADAPTIVE_DRIFT_DECAY_TOTAL, "pattern" => pattern_label.clone(), "partition_id" => partition_label.clone()),
-            m_backstop_freeze: counter!(ADAPTIVE_BACKSTOP_TOTAL, "pattern" => pattern_label.clone(), "partition_id" => partition_label.clone(), "action" => "freeze"),
-            m_backstop_trim: counter!(ADAPTIVE_BACKSTOP_TOTAL, "pattern" => pattern_label.clone(), "partition_id" => partition_label.clone(), "action" => "trim"),
+            m_samples: counter!(names.samples, key => label.clone(), "partition_id" => partition_label.clone()),
+            m_hold_time: histogram!(names.hold_time, key => label.clone()),
+            m_in_flight: gauge!(names.in_flight, key => label.clone(), "partition_id" => partition_label.clone()),
+            m_limit: gauge!(names.limit, key => label.clone(), "partition_id" => partition_label.clone()),
+            m_long_rtt: gauge!(names.long_rtt, key => label.clone(), "partition_id" => partition_label.clone()),
+            m_short_rtt: gauge!(names.short_rtt, key => label.clone(), "partition_id" => partition_label.clone()),
+            m_gradient: gauge!(names.gradient, key => label.clone(), "partition_id" => partition_label.clone()),
+            m_sojourn_min: gauge!(names.sojourn_min, key => label.clone(), "partition_id" => partition_label.clone()),
+            m_drift_decay: counter!(names.drift_decay, key => label.clone(), "partition_id" => partition_label.clone()),
+            m_backstop_freeze: counter!(names.backstop, key => label.clone(), "partition_id" => partition_label.clone(), "action" => "freeze"),
+            m_backstop_trim: counter!(names.backstop, key => label.clone(), "partition_id" => partition_label.clone(), "action" => "trim"),
             m_out_increase: outcome_counter("increase"),
             m_out_decrease: outcome_counter("decrease"),
             m_out_clamp_min: outcome_counter("clamp_min"),
@@ -193,7 +276,27 @@ impl Gradient2Controller {
     /// True when the given config equals this controller's — the caller keeps
     /// the learned state on identical re-upserts.
     pub fn config_matches(&self, cfg: &AdaptiveConcurrency) -> bool {
-        self.cfg == *cfg
+        let min = cfg.min.map(NonZeroU32::get).unwrap_or(DEFAULT_MIN);
+        self.params
+            == ControllerParams {
+                min,
+                max: cfg.max.map(NonZeroU32::get).unwrap_or(DEFAULT_MAX).max(min),
+                tolerance_permille: cfg
+                    .tolerance_permille
+                    .map(NonZeroU32::get)
+                    .unwrap_or(DEFAULT_TOLERANCE_PERMILLE),
+                smoothing_permille: cfg
+                    .smoothing_permille
+                    .map(NonZeroU32::get)
+                    .unwrap_or(DEFAULT_SMOOTHING_PERMILLE),
+                initial: cfg.max.map(|max| min + (max.get().max(min) - min) / 4),
+            }
+    }
+
+    /// Current parameters.
+    #[allow(dead_code)]
+    pub fn params(&self) -> ControllerParams {
+        self.params
     }
 
     pub fn current_limit(&self) -> NonZeroU32 {
