@@ -290,6 +290,11 @@ impl<S: VQueueStore> VQueueState<S> {
             slot.meta(),
             inbox_head_key,
             &inbox_head_value.metadata,
+            matches!(
+                inbox_head_value.status,
+                restate_storage_api::vqueue_table::Status::New
+                    | restate_storage_api::vqueue_table::Status::Scheduled
+            ),
             &mut self.current_permit,
         ) {
             AcquireOutcome::Acquired(resources) => {

@@ -139,7 +139,7 @@ where
                 // pending call among the awaited futures) consumes nothing
                 // downstream — release its chain permit and pause its clock.
                 if ctx.is_leader
-                    && !matches!(in_flight_invocation_metadata.source, Source::Service(..))
+                    && !matches!(in_flight_invocation_metadata.source, Source::Service(..) | Source::Internal)
                     && !awaits_a_call(ctx, self.invocation_id, &self.awaiting_on).await?
                 {
                     ctx.action_collector.push(Action::ChainSignal(ChainSignal {
@@ -162,8 +162,9 @@ where
     }
 }
 
-/// True when any awaited future is the result of a `Call` command — the
-/// root is then waiting on its own chain, not on the outside world.
+/// True when any awaited future is the result of a call (`Call`, or an
+/// `AttachInvocation`/`GetInvocationOutput` on a one-way call) — the root is
+/// then waiting on invocations, not on the outside world.
 async fn awaits_a_call<S: ReadJournalTable>(
     ctx: &mut StateMachineApplyContext<'_, S>,
     invocation_id: InvocationId,
@@ -177,7 +178,10 @@ async fn awaits_a_call<S: ReadJournalTable>(
             .storage
             .get_command_by_completion_id(invocation_id, completion_id)
             .await?
-            && command.command_type() == CommandType::Call
+            && matches!(
+                command.command_type(),
+                CommandType::Call | CommandType::AttachInvocation | CommandType::GetInvocationOutput
+            )
         {
             return Ok(true);
         }

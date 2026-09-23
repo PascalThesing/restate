@@ -116,6 +116,14 @@ impl VQueue<'_, (), ()> {
     ) -> VQueueId {
         util::infer_vqueue_id_from_invocation(partition_key, invocation_target, limit_key)
     }
+
+    pub fn infer_root_vqueue_id_from_invocation(
+        partition_key: PartitionKey,
+        invocation_target: &InvocationTarget,
+        limit_key: &LimitKey<ReString>,
+    ) -> VQueueId {
+        util::infer_root_vqueue_id_from_invocation(partition_key, invocation_target, limit_key)
+    }
 }
 
 impl<'a, A, S> VQueue<'a, A, S>

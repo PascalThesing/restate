@@ -15,7 +15,7 @@ use cling::prelude::*;
 
 use restate_admin_rest_model::rules::UpsertRuleRequest;
 use restate_cli_util::c_success;
-use restate_limiter::{AdaptiveConcurrency, Precondition, UserLimits};
+use restate_limiter::{Precondition, UserLimits};
 use restate_types::Version;
 
 use super::{fetch_rule, parse_pattern, upsert_one};
@@ -45,36 +45,6 @@ pub struct Set {
     #[clap(long)]
     weight: Option<NonZeroU32>,
 
-    /// Enable the adaptive (Gradient2) concurrency controller with defaults
-    /// (min 4/partition, max 10000, tolerance 1.5x, smoothing 0.2). The
-    /// learned limit replaces a static --concurrency; if both are set, the
-    /// static limit takes precedence (instant rollback path). Recommended:
-    /// pair with --adaptive-max set to the previous static cap.
-    #[clap(long, conflicts_with = "no_adaptive")]
-    adaptive: bool,
-
-    /// Adaptive lower bound (>= 1). Implies --adaptive.
-    #[clap(long, conflicts_with = "no_adaptive")]
-    adaptive_min: Option<NonZeroU32>,
-
-    /// Adaptive upper bound (>= 1). Implies --adaptive.
-    #[clap(long, conflicts_with = "no_adaptive")]
-    adaptive_max: Option<NonZeroU32>,
-
-    /// Adaptive tolerance as a factor, e.g. 1.5 (stored as permille).
-    /// Implies --adaptive.
-    #[clap(long, conflicts_with = "no_adaptive")]
-    adaptive_tolerance: Option<f64>,
-
-    /// Adaptive smoothing factor, e.g. 0.2 (stored as permille).
-    /// Implies --adaptive.
-    #[clap(long, conflicts_with = "no_adaptive")]
-    adaptive_smoothing: Option<f64>,
-
-    /// Remove the adaptive controller from the rule.
-    #[clap(long)]
-    no_adaptive: bool,
-
     /// Description for the rule
     #[clap(long)]
     description: Option<String>,
@@ -85,43 +55,8 @@ pub struct Set {
     disabled: bool,
 }
 
-/// Converts a factor flag (e.g. 1.5) to permille (1500), validating range.
-fn factor_to_permille(name: &str, value: Option<f64>, max: f64) -> Result<Option<NonZeroU32>> {
-    match value {
-        None => Ok(None),
-        Some(v) if v.is_finite() && v > 0.0 && v <= max => {
-            Ok(NonZeroU32::new((v * 1000.0).round() as u32))
-        }
-        Some(v) => bail!("--{name} must be a factor in (0, {max}] (got {v})"),
-    }
-}
-
 pub async fn run_set(State(env): State<CliEnv>, opts: &Set) -> Result<()> {
     let pattern = parse_pattern(&opts.pattern)?;
-    // Any adaptive-* flag implies --adaptive
-    let wants_adaptive = opts.adaptive
-        || opts.adaptive_min.is_some()
-        || opts.adaptive_max.is_some()
-        || opts.adaptive_tolerance.is_some()
-        || opts.adaptive_smoothing.is_some();
-    let adaptive_flags = if wants_adaptive {
-        Some(AdaptiveConcurrency {
-            min: opts.adaptive_min,
-            max: opts.adaptive_max,
-            tolerance_permille: factor_to_permille(
-                "adaptive-tolerance",
-                opts.adaptive_tolerance,
-                1000.0,
-            )?,
-            smoothing_permille: factor_to_permille(
-                "adaptive-smoothing",
-                opts.adaptive_smoothing,
-                1.0,
-            )?,
-        })
-    } else {
-        None
-    };
     let canonical = pattern.to_string();
 
     let sql_client = DataFusionHttpClient::new(&env).await?;
@@ -136,8 +71,7 @@ pub async fn run_set(State(env): State<CliEnv>, opts: &Set) -> Result<()> {
             } else {
                 opts.concurrency
             })
-            .with_scheduling_weight(opts.weight)
-            .with_adaptive_concurrency(adaptive_flags.clone()),
+            .with_scheduling_weight(opts.weight),
             description: opts.description.clone(),
             disabled: opts.disabled,
             precondition: Precondition::DoesNotExist,
@@ -158,20 +92,9 @@ pub async fn run_set(State(env): State<CliEnv>, opts: &Set) -> Result<()> {
                 .clone()
                 .or_else(|| rule.description.clone());
             let scheduling_weight = opts.weight.or_else(|| rule.scheduling_weight());
-            // Preserve-on-omit: without adaptive flags the existing adaptive
-            // config survives; --no-adaptive clears it; adaptive flags replace it.
-            let adaptive = if opts.no_adaptive {
-                None
-            } else {
-                adaptive_flags
-                    .clone()
-                    .or_else(|| rule.adaptive_concurrency())
-            };
             UpsertRuleRequest {
                 pattern,
-                limits: UserLimits::new(concurrency)
-                    .with_scheduling_weight(scheduling_weight)
-                    .with_adaptive_concurrency(adaptive),
+                limits: UserLimits::new(concurrency).with_scheduling_weight(scheduling_weight),
                 description,
                 disabled: rule.disabled,
                 precondition: Precondition::Matches(Version::from(rule.version)),

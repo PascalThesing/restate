@@ -55,16 +55,6 @@ pub(crate) struct RuleRow {
     #[serde(default)]
     pub scheduling_weight: Option<u32>,
     #[serde(default)]
-    pub adaptive: Option<bool>,
-    #[serde(default)]
-    pub adaptive_min: Option<u32>,
-    #[serde(default)]
-    pub adaptive_max: Option<u32>,
-    #[serde(default)]
-    pub adaptive_tolerance_permille: Option<u32>,
-    #[serde(default)]
-    pub adaptive_smoothing_permille: Option<u32>,
-    #[serde(default)]
     pub description: Option<String>,
     pub disabled: bool,
     pub version: u32,
@@ -81,19 +71,6 @@ impl RuleRow {
     /// The scheduling weight as a `NonZeroU32` (the runtime shape).
     fn scheduling_weight(&self) -> Option<std::num::NonZeroU32> {
         self.scheduling_weight.and_then(std::num::NonZeroU32::new)
-    }
-
-    /// The adaptive controller config in runtime shape, when configured.
-    fn adaptive_concurrency(&self) -> Option<restate_limiter::AdaptiveConcurrency> {
-        if self.adaptive != Some(true) {
-            return None;
-        }
-        Some(restate_limiter::AdaptiveConcurrency {
-            min: self.adaptive_min.and_then(NonZeroU32::new),
-            max: self.adaptive_max.and_then(NonZeroU32::new),
-            tolerance_permille: self.adaptive_tolerance_permille.and_then(NonZeroU32::new),
-            smoothing_permille: self.adaptive_smoothing_permille.and_then(NonZeroU32::new),
-        })
     }
 }
 

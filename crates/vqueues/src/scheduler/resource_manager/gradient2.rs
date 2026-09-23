@@ -8,20 +8,16 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-//! Adaptive concurrency controller (Netflix Gradient2 style) for user
-//! concurrency rules. One controller instance exists per adaptive rule.
-//! The latency signal is the permit hold time (acquire to release);
-//! it is suspension-filtered by construction, so journal-wait dwell
-//! never pollutes the signal.
+//! Adaptive concurrency controller (Netflix Gradient2 style). One instance
+//! exists per root service (chain admission); the latency signal is the
+//! chain's active end-to-end time.
 //!
 //! The limit grows/shrinks by the ratio of a slow baseline to the current
 //! short sample, clamped to `[min, max]`; growth is additive only and
 //! never revokes issued permits.
 //!
-//! A CoDel-style sojourn backstop guards slow creeping degradation that
-//! Gradient2 alone can miss: if the minimum acquire-side sojourn stays
-//! above target for a full window while the limit sits at its ceiling,
-//! increases freeze, and persistence trims the limit once per episode.
+//! Slow creep (latency rising so gradually that the baseline follows it) is
+//! not detected; drift decay only deflates an inflated baseline.
 
 use std::num::NonZeroU32;
 use std::time::Duration;
@@ -29,15 +25,10 @@ use std::time::Duration;
 use metrics::{Counter, Gauge, Histogram, counter, gauge, histogram};
 use tokio::time::Instant;
 
-use restate_limiter::AdaptiveConcurrency;
-
 use crate::metric_definitions::{
-    ADAPTIVE_BACKSTOP_TOTAL, ADAPTIVE_DRIFT_DECAY_TOTAL, ADAPTIVE_GRADIENT, ADAPTIVE_IN_FLIGHT,
-    ADAPTIVE_LIMIT, ADAPTIVE_LONG_RTT_MS, ADAPTIVE_SAMPLES_TOTAL, ADAPTIVE_SHORT_RTT_MS,
-    ADAPTIVE_SOJOURN_MIN_MS, ADAPTIVE_UPDATES_TOTAL, CHAIN_ACTIVE_TIME_SECONDS,
-    CHAIN_BACKSTOP_TOTAL, CHAIN_DRIFT_DECAY_TOTAL, CHAIN_GRADIENT, CHAIN_IN_PROGRESS,
-    CHAIN_LIMIT, CHAIN_LONG_RTT_MS, CHAIN_SAMPLES_TOTAL, CHAIN_SHORT_RTT_MS,
-    CHAIN_SOJOURN_MIN_MS, CHAIN_UPDATES_TOTAL, HOLD_TIME_SECONDS,
+    CHAIN_ACTIVE_TIME_SECONDS, CHAIN_DRIFT_DECAY_TOTAL, CHAIN_GRADIENT,
+    CHAIN_IN_PROGRESS, CHAIN_LIMIT, CHAIN_LONG_RTT_MS, CHAIN_SAMPLES_TOTAL, CHAIN_SHORT_RTT_MS,
+    CHAIN_UPDATES_TOTAL,
 };
 
 /// Numeric parameters of one controller, independent of what it governs.
@@ -55,8 +46,6 @@ pub struct ControllerParams {
 /// Which metric family a controller reports into.
 #[derive(Debug, Clone, Copy)]
 pub enum ControllerFamily {
-    /// Per user rule; label `pattern`.
-    Rule,
     /// Per root service (chain admission); label `root`.
     Chain,
 }
@@ -70,26 +59,9 @@ struct MetricNames {
     long_rtt: &'static str,
     short_rtt: &'static str,
     gradient: &'static str,
-    sojourn_min: &'static str,
     drift_decay: &'static str,
-    backstop: &'static str,
     updates: &'static str,
 }
-
-const RULE_METRICS: MetricNames = MetricNames {
-    label: "pattern",
-    samples: ADAPTIVE_SAMPLES_TOTAL,
-    hold_time: HOLD_TIME_SECONDS,
-    in_flight: ADAPTIVE_IN_FLIGHT,
-    limit: ADAPTIVE_LIMIT,
-    long_rtt: ADAPTIVE_LONG_RTT_MS,
-    short_rtt: ADAPTIVE_SHORT_RTT_MS,
-    gradient: ADAPTIVE_GRADIENT,
-    sojourn_min: ADAPTIVE_SOJOURN_MIN_MS,
-    drift_decay: ADAPTIVE_DRIFT_DECAY_TOTAL,
-    backstop: ADAPTIVE_BACKSTOP_TOTAL,
-    updates: ADAPTIVE_UPDATES_TOTAL,
-};
 
 const CHAIN_METRICS: MetricNames = MetricNames {
     label: "root",
@@ -100,25 +72,10 @@ const CHAIN_METRICS: MetricNames = MetricNames {
     long_rtt: CHAIN_LONG_RTT_MS,
     short_rtt: CHAIN_SHORT_RTT_MS,
     gradient: CHAIN_GRADIENT,
-    sojourn_min: CHAIN_SOJOURN_MIN_MS,
     drift_decay: CHAIN_DRIFT_DECAY_TOTAL,
-    backstop: CHAIN_BACKSTOP_TOTAL,
     updates: CHAIN_UPDATES_TOTAL,
 };
 
-/// Default lower bound: below ~2-4 slots long-running handlers stop producing
-/// a usable gradient (and throughput dies).
-const DEFAULT_MIN: u32 = 4;
-/// Default upper bound: practically open — the node-level invoker permit pool
-/// is the real system ceiling. An explicit max (e.g. the previous static cap)
-/// is recommended as a guardrail against the first-burst blind phase after
-/// idle periods.
-const DEFAULT_MAX: u32 = 10_000;
-/// Default tolerance (permille): current sample may be 1.5x the baseline
-/// before the limit shrinks.
-const DEFAULT_TOLERANCE_PERMILLE: u32 = 1_500;
-/// Default smoothing (permille): bounds shrink to ~10%/update.
-const DEFAULT_SMOOTHING_PERMILLE: u32 = 200;
 /// Additive growth headroom per update (Netflix queueSize constant).
 const QUEUE_SIZE: f64 = 4.0;
 /// Minimum interval between limit updates (Temporal ramp-throttle lesson).
@@ -127,11 +84,6 @@ const MIN_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 const LONG_EMA_TIME_CONSTANT: Duration = Duration::from_secs(120);
 /// Number of warm-up samples averaged arithmetically before the EMA takes over.
 const WARMUP_SAMPLES: u32 = 10;
-/// Sojourn backstop: target acquire-side wait and evaluation window.
-const BACKSTOP_SOJOURN_TARGET: Duration = Duration::from_secs(5);
-const BACKSTOP_WINDOW: Duration = Duration::from_secs(5);
-/// Consecutive over-target windows before trimming (after freezing).
-const BACKSTOP_TRIM_WINDOWS: u32 = 2;
 
 /// Outcome of feeding one sample; used for metrics and by the caller to
 /// decide whether waiters need waking (limit increased).
@@ -163,10 +115,7 @@ pub struct Gradient2Controller {
     m_long_rtt: Gauge,
     m_short_rtt: Gauge,
     m_gradient: Gauge,
-    m_sojourn_min: Gauge,
     m_drift_decay: Counter,
-    m_backstop_freeze: Counter,
-    m_backstop_trim: Counter,
     m_out_increase: Counter,
     m_out_decrease: Counter,
     m_out_clamp_min: Counter,
@@ -181,38 +130,9 @@ pub struct Gradient2Controller {
     last_update: Instant,
     last_sample: Instant,
 
-    // -- sojourn backstop ---------------------------------------------------
-    window_start: Instant,
-    window_min_sojourn: Option<Duration>,
-    over_target_windows: u32,
-    freeze_increases: bool,
-    trimmed_this_episode: bool,
 }
 
 impl Gradient2Controller {
-    pub fn from_config(
-        cfg: &AdaptiveConcurrency,
-        pattern_label: String,
-        partition_label: String,
-        now: Instant,
-    ) -> Self {
-        let min = cfg.min.map(NonZeroU32::get).unwrap_or(DEFAULT_MIN);
-        let params = ControllerParams {
-            min,
-            max: cfg.max.map(NonZeroU32::get).unwrap_or(DEFAULT_MAX).max(min),
-            tolerance_permille: cfg
-                .tolerance_permille
-                .map(NonZeroU32::get)
-                .unwrap_or(DEFAULT_TOLERANCE_PERMILLE),
-            smoothing_permille: cfg
-                .smoothing_permille
-                .map(NonZeroU32::get)
-                .unwrap_or(DEFAULT_SMOOTHING_PERMILLE),
-            initial: cfg.max.map(|max| min + (max.get().max(min) - min) / 4),
-        };
-        Self::new(params, ControllerFamily::Rule, pattern_label, partition_label, now)
-    }
-
     pub fn new(
         params: ControllerParams,
         family: ControllerFamily,
@@ -221,7 +141,6 @@ impl Gradient2Controller {
         now: Instant,
     ) -> Self {
         let names: &'static MetricNames = match family {
-            ControllerFamily::Rule => &RULE_METRICS,
             ControllerFamily::Chain => &CHAIN_METRICS,
         };
         let min = params.min.max(1) as f64;
@@ -248,10 +167,7 @@ impl Gradient2Controller {
             m_long_rtt: gauge!(names.long_rtt, key => label.clone(), "partition_id" => partition_label.clone()),
             m_short_rtt: gauge!(names.short_rtt, key => label.clone(), "partition_id" => partition_label.clone()),
             m_gradient: gauge!(names.gradient, key => label.clone(), "partition_id" => partition_label.clone()),
-            m_sojourn_min: gauge!(names.sojourn_min, key => label.clone(), "partition_id" => partition_label.clone()),
             m_drift_decay: counter!(names.drift_decay, key => label.clone(), "partition_id" => partition_label.clone()),
-            m_backstop_freeze: counter!(names.backstop, key => label.clone(), "partition_id" => partition_label.clone(), "action" => "freeze"),
-            m_backstop_trim: counter!(names.backstop, key => label.clone(), "partition_id" => partition_label.clone(), "action" => "trim"),
             m_out_increase: outcome_counter("increase"),
             m_out_decrease: outcome_counter("decrease"),
             m_out_clamp_min: outcome_counter("clamp_min"),
@@ -263,34 +179,9 @@ impl Gradient2Controller {
             warmup_sum: 0.0,
             last_update: now,
             last_sample: now,
-            window_start: now,
-            window_min_sojourn: None,
-            over_target_windows: 0,
-            freeze_increases: false,
-            trimmed_this_episode: false,
         };
         controller.emit_state_gauges(1.0);
         controller
-    }
-
-    /// True when the given config equals this controller's — the caller keeps
-    /// the learned state on identical re-upserts.
-    pub fn config_matches(&self, cfg: &AdaptiveConcurrency) -> bool {
-        let min = cfg.min.map(NonZeroU32::get).unwrap_or(DEFAULT_MIN);
-        self.params
-            == ControllerParams {
-                min,
-                max: cfg.max.map(NonZeroU32::get).unwrap_or(DEFAULT_MAX).max(min),
-                tolerance_permille: cfg
-                    .tolerance_permille
-                    .map(NonZeroU32::get)
-                    .unwrap_or(DEFAULT_TOLERANCE_PERMILLE),
-                smoothing_permille: cfg
-                    .smoothing_permille
-                    .map(NonZeroU32::get)
-                    .unwrap_or(DEFAULT_SMOOTHING_PERMILLE),
-                initial: cfg.max.map(|max| min + (max.get().max(min) - min) / 4),
-            }
     }
 
     /// Current parameters.
@@ -345,7 +236,6 @@ impl Gradient2Controller {
             return UpdateOutcome::IntervalSkip;
         }
         self.last_update = now;
-        self.roll_backstop_window(now);
         self.m_in_flight.set(in_flight as f64);
 
         // App-limited guard: no growth without real demand.
@@ -356,10 +246,6 @@ impl Gradient2Controller {
         let gradient = (self.tolerance * self.long_ema / sample_ms).clamp(0.5, 1.0);
         let mut new_limit = self.limit * gradient + QUEUE_SIZE;
         new_limit = self.limit * (1.0 - self.smoothing) + new_limit * self.smoothing;
-
-        if self.freeze_increases && new_limit > self.limit {
-            new_limit = self.limit;
-        }
 
         let outcome = if new_limit <= self.min {
             new_limit = self.min;
@@ -374,49 +260,6 @@ impl Gradient2Controller {
         };
         self.limit = new_limit;
         self.finish_update(outcome, sample_ms, gradient)
-    }
-
-    /// Feeds one acquire-side sojourn observation (time the head entry spent
-    /// runnable in the durable queue before admission was attempted). Drives
-    /// the CoDel-style backstop.
-    pub fn on_sojourn(&mut self, sojourn: Duration, now: Instant) {
-        self.window_min_sojourn = Some(match self.window_min_sojourn {
-            Some(current) => current.min(sojourn),
-            None => sojourn,
-        });
-        self.roll_backstop_window(now);
-    }
-
-    fn roll_backstop_window(&mut self, now: Instant) {
-        if now.saturating_duration_since(self.window_start) < BACKSTOP_WINDOW {
-            return;
-        }
-        let min_sojourn = self.window_min_sojourn.take();
-        self.window_start = now;
-        self.m_sojourn_min
-            .set(min_sojourn.map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0));
-
-        let at_ceiling = self.limit >= 0.95 * self.max;
-        let over_target = matches!(min_sojourn, Some(s) if s > BACKSTOP_SOJOURN_TARGET);
-        if over_target && at_ceiling {
-            self.over_target_windows += 1;
-            if !self.freeze_increases {
-                self.freeze_increases = true;
-                self.m_backstop_freeze.increment(1);
-            }
-            if self.over_target_windows >= BACKSTOP_TRIM_WINDOWS && !self.trimmed_this_episode {
-                self.limit = (self.limit * 0.9).max(self.min);
-                self.trimmed_this_episode = true;
-                self.m_backstop_trim.increment(1);
-            }
-        } else if matches!(min_sojourn, Some(s) if s <= BACKSTOP_SOJOURN_TARGET) {
-            // Observed sojourn back under target: episode over. Over-target
-            // windows below the ceiling (e.g. right after a trim) keep the
-            // episode state — only genuine recovery unfreezes.
-            self.over_target_windows = 0;
-            self.freeze_increases = false;
-            self.trimmed_this_episode = false;
-        }
     }
 
     fn finish_update(
@@ -444,18 +287,6 @@ impl Gradient2Controller {
         self.m_gradient.set(gradient);
     }
 
-    /// Zeroes all state gauges. Called when the controller is dropped (rule
-    /// removed or overridden by a static concurrency) so dashboards show "no
-    /// adaptive controller" instead of the last learned values forever.
-    pub fn zero_gauges(&self) {
-        self.m_limit.set(0.0);
-        self.m_in_flight.set(0.0);
-        self.m_gradient.set(0.0);
-        self.m_short_rtt.set(0.0);
-        self.m_long_rtt.set(0.0);
-        self.m_sojourn_min.set(0.0);
-    }
-
     #[cfg(test)]
     pub fn limit_f64(&self) -> f64 {
         self.limit
@@ -465,28 +296,24 @@ impl Gradient2Controller {
     pub fn long_ema(&self) -> f64 {
         self.long_ema
     }
-
-    #[cfg(test)]
-    pub fn is_frozen(&self) -> bool {
-        self.freeze_increases
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn cfg() -> AdaptiveConcurrency {
-        AdaptiveConcurrency {
-            min: NonZeroU32::new(4),
-            max: NonZeroU32::new(300),
-            tolerance_permille: None,
-            smoothing_permille: None,
+    fn params() -> ControllerParams {
+        ControllerParams {
+            min: 4,
+            max: 300,
+            tolerance_permille: 1500,
+            smoothing_permille: 200,
+            initial: Some(4 + (300 - 4) / 4),
         }
     }
 
     fn controller(now: Instant) -> Gradient2Controller {
-        Gradient2Controller::from_config(&cfg(), "payment".into(), "0".into(), now)
+        Gradient2Controller::new(params(), ControllerFamily::Chain, "payment".into(), "0".into(), now)
     }
 
     fn ms(v: u64) -> Duration {
@@ -510,9 +337,16 @@ mod tests {
         // corridor start: min + (max-min)/4 = 4 + 74 = 78
         assert_eq!(c.current_limit().get(), 78);
 
-        // without max: min*8
-        let c2 = Gradient2Controller::from_config(
-            &AdaptiveConcurrency::default(),
+        // no explicit initial: min*8
+        let c2 = Gradient2Controller::new(
+            ControllerParams {
+                min: 4,
+                max: 10_000,
+                tolerance_permille: 1500,
+                smoothing_permille: 200,
+                initial: None,
+            },
+            ControllerFamily::Chain,
             "p".into(),
             "0".into(),
             now,
@@ -631,35 +465,5 @@ mod tests {
         drive(&mut c, &mut now, Duration::from_secs(3600), 5);
         assert!(c.limit_f64().is_finite());
         assert!((4.0..=300.0).contains(&c.limit_f64()));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn backstop_freezes_then_trims_once_per_episode() {
-        let mut now = Instant::now();
-        let mut c = controller(now);
-        drive(&mut c, &mut now, ms(100), 400);
-        assert_eq!(c.current_limit().get(), 300); // at ceiling
-
-        // sustained high sojourn: freeze after first window, trim after second
-        for _ in 0..4 {
-            now += Duration::from_millis(5100);
-            c.on_sojourn(Duration::from_secs(8), now);
-        }
-        assert!(c.is_frozen());
-        let trimmed = c.limit_f64();
-        assert!(trimmed <= 300.0 * 0.9 + 1.0);
-        // more over-target windows: no second trim within the episode
-        for _ in 0..4 {
-            now += Duration::from_millis(5100);
-            c.on_sojourn(Duration::from_secs(8), now);
-        }
-        assert!((c.limit_f64() - trimmed).abs() < 1.0);
-
-        // recovery ends the episode
-        now += Duration::from_millis(5100);
-        c.on_sojourn(ms(10), now);
-        now += Duration::from_millis(5100);
-        c.on_sojourn(ms(10), now);
-        assert!(!c.is_frozen());
     }
 }

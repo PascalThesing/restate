@@ -605,6 +605,7 @@ pub struct ChainAdmissionOptions {
     /// # Enabled
     ///
     /// Gate root invocations on their root service's learned chain limit.
+    /// Off by default.
     pub enabled: bool,
     /// # Minimum chains in progress
     ///
@@ -634,7 +635,7 @@ pub struct ChainAdmissionOptions {
 impl Default for ChainAdmissionOptions {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             min: NonZeroU32::new(4).expect("is non zero"),
             max: None,
             tolerance_permille: NonZeroU32::new(1500).expect("is non zero"),

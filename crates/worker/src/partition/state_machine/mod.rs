@@ -65,7 +65,6 @@ use restate_storage_api::timer_table::TimerKey;
 use restate_storage_api::timer_table::{Timer, WriteTimerTable};
 use restate_storage_api::vqueue_table::scheduler::{self, YieldReason};
 use restate_storage_api::vqueue_table::{self, EntryKey, Stage};
-use restate_types::ServiceName;
 use restate_worker_api::resources::{ChainSignal, ChainSignalKind};
 use restate_storage_api::vqueue_table::{EntryStatusHeader, ReadVQueueTable, WriteVQueueTable};
 use restate_storage_api::{Result as StorageResult, journal_table};
@@ -155,9 +154,10 @@ impl PartitionFeatures for StateMachine {
         self.enabled_features.scope_inheritance
     }
 
-    fn is_limit_key_derivation_enabled(&self) -> bool {
-        self.enabled_features.limit_key_derivation
+    fn is_chain_root_queues_enabled(&self) -> bool {
+        self.enabled_features.chain_root_queues
     }
+
 }
 
 impl<S> PartitionFeatures for StateMachineApplyContext<'_, S> {
@@ -177,9 +177,10 @@ impl<S> PartitionFeatures for StateMachineApplyContext<'_, S> {
         self.enabled_features.scope_inheritance
     }
 
-    fn is_limit_key_derivation_enabled(&self) -> bool {
-        self.enabled_features.limit_key_derivation
+    fn is_chain_root_queues_enabled(&self) -> bool {
+        self.enabled_features.chain_root_queues
     }
+
 }
 pub struct StateMachine {
     // initialized from persistent storage
@@ -1020,13 +1021,26 @@ impl<S> StateMachineApplyContext<'_, S> {
         // Prepare PreFlightInvocationMetadata structure
         let submit_notification_sink = service_invocation.submit_notification_sink.take();
 
-        let qid = self
-            .is_vqueues_enabled()
-            .then_some(VQueue::infer_vqueue_id_from_invocation(
-                service_invocation.partition_key(),
-                &service_invocation.invocation_target,
-                &service_invocation.limit_key,
-            ));
+        // Chain roots of non-exclusive targets get their own vqueue, so a root
+        // parked on its chain permit can never sit in front of a child call to
+        // the same service (head-of-line). Deterministic: partition feature.
+        let chain_root = self.is_chain_root_queues_enabled()
+            && is_chain_root(&service_invocation.source, &service_invocation.invocation_target);
+        let qid = self.is_vqueues_enabled().then(|| {
+            if chain_root {
+                VQueue::infer_root_vqueue_id_from_invocation(
+                    service_invocation.partition_key(),
+                    &service_invocation.invocation_target,
+                    &service_invocation.limit_key,
+                )
+            } else {
+                VQueue::infer_vqueue_id_from_invocation(
+                    service_invocation.partition_key(),
+                    &service_invocation.invocation_target,
+                    &service_invocation.limit_key,
+                )
+            }
+        });
 
         let pre_flight_invocation_metadata = PreFlightInvocationMetadata::from_service_invocation(
             self.record_created_at,
@@ -1211,16 +1225,14 @@ impl<S> StateMachineApplyContext<'_, S> {
             .vqueue_id
             .as_ref()
             .expect("invariant violation: vqueue id must be set");
-        // A root (no calling invocation) starts a chain: tell the scheduler
-        // before the enqueue event so the entry is gated on its first run.
-        if self.is_leader && !matches!(metadata.source, Source::Service(..)) {
-            self.action_collector.push(Action::ChainSignal(ChainSignal {
-                entry_id: EntryId::from(invocation_id),
-                kind: ChainSignalKind::NewStart {
-                    root: ServiceName::new(metadata.invocation_target.service_name()),
-                },
-            }));
-        }
+        // A root (nothing called it) starts a chain: mark it durably so the
+        // scheduler gates it — also under a later leader.
+        let entry_metadata = vqueue_table::EntryMetadata {
+            chain_root: (self.is_chain_root_queues_enabled()
+                && is_chain_root(&metadata.source, &metadata.invocation_target))
+                .then(|| ReString::from(metadata.invocation_target.service_name().to_string())),
+            ..Default::default()
+        };
         VQueue::vqueue_from_invocation_target(
             record_unique_ts,
             qid,
@@ -1236,7 +1248,7 @@ impl<S> StateMachineApplyContext<'_, S> {
             self.record_lsn,
             metadata.execution_time,
             EntryId::from(invocation_id),
-            vqueue_table::EntryMetadata::default(),
+            entry_metadata,
         );
 
         // 1. Check if we need to schedule it
@@ -3917,28 +3929,6 @@ impl<S> StateMachineApplyContext<'_, S> {
                             callee_invocation_target.with_scope(Some(scope.clone()));
                     }
 
-                    // Limit-key derivation (journal-v2 equivalent: call_commands.rs):
-                    // a scoped child without an explicit key derives
-                    // `limit_key = <target service name>` for per-service
-                    // sub-bulkhead rules. Deterministic, feature-gated.
-                    let derived_limit_key = if self.is_limit_key_derivation_enabled()
-                        && callee_invocation_target.scope().is_some()
-                    {
-                        match callee_invocation_target.service_name().parse() {
-                            Ok(l1) => restate_types::limit_key::LimitKey::l1(l1),
-                            Err(err) => {
-                                tracing::debug!(
-                                    service = %callee_invocation_target.service_name(),
-                                    %err,
-                                    "limit-key derivation skipped: service name not a valid limit key"
-                                );
-                                Default::default()
-                            }
-                        }
-                    } else {
-                        Default::default()
-                    };
-
                     let service_invocation = Box::new(ServiceInvocation {
                         invocation_id: *callee_invocation_id,
                         invocation_target: callee_invocation_target,
@@ -3958,7 +3948,7 @@ impl<S> StateMachineApplyContext<'_, S> {
                             .unwrap_or_default(),
                         journal_retention_duration: Default::default(),
                         idempotency_key: request.idempotency_key,
-                        limit_key: derived_limit_key,
+                        limit_key: Default::default(),
                         submit_notification_sink: None,
                         restate_version: RestateVersion::current(),
                     });
@@ -5732,3 +5722,17 @@ fn should_use_journal_table_v2(status: &InvocationStatus) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+/// A chain root is an invocation nothing called (ingress, subscription,
+/// restart-as-new) on a non-exclusive target. Exclusive Virtual Object calls
+/// keep their per-key queue (and ordering) and are not gated.
+fn is_chain_root(source: &Source, target: &InvocationTarget) -> bool {
+    !matches!(source, Source::Service(..) | Source::Internal)
+        && !matches!(
+            target,
+            InvocationTarget::VirtualObject {
+                handler_ty: VirtualObjectHandlerType::Exclusive,
+                ..
+            }
+        )
+}

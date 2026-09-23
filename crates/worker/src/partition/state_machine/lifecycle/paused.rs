@@ -20,12 +20,14 @@ use restate_storage_api::lock_table::WriteLockTable;
 use restate_storage_api::vqueue_table::{EntryStatusHeader, ReadVQueueTable, WriteVQueueTable};
 use restate_types::identifiers::{InvocationId, WithPartitionKey as _};
 use restate_types::journal_events::raw::RawEvent;
+use restate_types::invocation::Source;
 use restate_types::vqueues::EntryId;
+use restate_worker_api::resources::{ChainSignal, ChainSignalKind};
 use restate_vqueues::VQueue;
 
 use crate::debug_if_leader;
 use crate::partition::state_machine::lifecycle::event::ApplyEventCommand;
-use crate::partition::state_machine::{CommandHandler, Error, StateMachineApplyContext};
+use crate::partition::state_machine::{Action, CommandHandler, Error, StateMachineApplyContext};
 
 pub struct OnPausedCommand<'a> {
     pub invocation_id: &'a InvocationId,
@@ -112,6 +114,15 @@ where
         .await?
         .expect("pausing in a non-existent vqueue")
         .pause_entry(at, &header);
+
+        // Chain admission: a paused root consumes nothing downstream; release
+        // its chain permit (re-admitted, ahead of new starts, on resume).
+        if ctx.is_leader && !matches!(metadata.source, Source::Service(..) | Source::Internal) {
+            ctx.action_collector.push(Action::ChainSignal(ChainSignal {
+                entry_id: EntryId::from(invocation_id),
+                kind: ChainSignalKind::Pause,
+            }));
+        }
     }
 
     let mut invocation_status = InvocationStatus::Paused(metadata);

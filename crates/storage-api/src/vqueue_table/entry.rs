@@ -198,6 +198,8 @@ pub struct EntryMetadataRef<'a> {
     pub retry_attempts: u32,
     #[bilrost(tag(4), encoding(fixed))]
     pub retry_count_since_last_stored_command: u32,
+    #[bilrost(tag(5))]
+    chain_root: Option<&'a str>,
 }
 
 impl<'a> From<&'a EntryMetadata> for EntryMetadataRef<'a> {
@@ -208,6 +210,7 @@ impl<'a> From<&'a EntryMetadata> for EntryMetadataRef<'a> {
             needed_memory: value.needed_memory,
             retry_attempts: value.retry_attempts,
             retry_count_since_last_stored_command: value.retry_count_since_last_stored_command,
+            chain_root: value.chain_root.as_deref(),
         }
     }
 }
@@ -224,6 +227,11 @@ pub struct EntryMetadata {
     pub retry_attempts: u32,
     #[bilrost(tag(4), encoding(fixed))]
     pub retry_count_since_last_stored_command: u32,
+    /// Root service name when this entry is a chain root (an invocation nothing
+    /// called). Drives chain admission; durable so a new leader gates the
+    /// backlog it inherits. `None` for children and pre-c8 entries.
+    #[bilrost(tag(5))]
+    pub chain_root: Option<ReString>,
 }
 
 #[cfg(test)]

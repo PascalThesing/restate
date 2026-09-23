@@ -83,6 +83,7 @@ async fn get_vqueue_entry_status_header_fields() {
         needed_memory: Some(needed_memory.into()),
         retry_attempts: 7,
         retry_count_since_last_stored_command: 2,
+        chain_root: None,
     };
 
     let mut tx = engine.partition_store().transaction();

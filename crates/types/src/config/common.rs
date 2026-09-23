@@ -670,20 +670,11 @@ experimental! {
     /// ingress invocation. Requires `vqueues`.
     scope_inheritance,
 
-    /// # Enables automatic limit-key derivation for scoped child invocations
-    ///
-    /// When enabled, a child invocation created via ctx.call/ctx.send that has
-    /// a scope (own or inherited) but no explicit limit key gets
-    /// `limit_key = <target service name>`, so per-service sub-bulkhead rules
-    /// (e.g. `tenant/OrderService`) bind without SDK changes. Requires
-    /// `vqueues` (and typically `scope_inheritance`).
-    limit_key_derivation,
 
     /// # Enables Kafka header support for scoped invocations
     ///
-    /// When enabled, Kafka subscriptions read `x-restate-scope` and
-    /// `x-restate-limit-key` record headers to drive vqueue scope and
-    /// hierarchical limit-key routing. Requires `vqueues` to also be enabled.
+    /// When enabled, Kafka subscriptions read the `x-restate-scope` record
+    /// header to drive vqueue scope routing. Requires `vqueues` to also be enabled.
     ///
     /// Since v1.7.0
     kafka_scope,

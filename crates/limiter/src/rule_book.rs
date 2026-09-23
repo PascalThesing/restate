@@ -484,7 +484,6 @@ mod tests {
             limits: UserLimits {
                 concurrency: NonZeroU32::new(concurrency),
                 scheduling_weight: None,
-                adaptive_concurrency: None,
             },
             description: None,
             disabled: false,
@@ -519,7 +518,6 @@ mod tests {
                 limits: UserLimits {
                     concurrency: NonZeroU32::new(1000),
                     scheduling_weight: None,
-                    adaptive_concurrency: None,
                 },
                 description: Some("global default".to_owned()),
                 disabled: false,
@@ -533,7 +531,6 @@ mod tests {
                 limits: UserLimits {
                     concurrency: NonZeroU32::new(10),
                     scheduling_weight: None,
-                    adaptive_concurrency: None,
                 },
                 description: None,
                 disabled: true,

@@ -8,18 +8,15 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::time::Duration;
-
 use smallvec::SmallVec;
 use tokio::sync::mpsc;
-use tokio::time::Instant;
 
 use restate_futures_util::concurrency::Permit;
 use restate_limiter::LimitKey;
 use restate_memory::MemoryLease;
 use restate_storage_api::vqueue_table::EntryMetadata;
 use restate_types::vqueues::EntryId;
-use restate_types::{Scope, ServiceName};
+use restate_types::Scope;
 use restate_util_string::ReString;
 
 // Re-export so consumers can keep importing from `restate_worker_api::resources`.
@@ -27,12 +24,8 @@ pub use restate_limiter::{RuleUpdate, UserLimits};
 
 pub enum ResourceManagerUpdate {
     /// User permits released by a completed (or suspended) run attempt.
-    /// `held_for` is the permit hold time (acquire to release) and feeds the
-    /// adaptive concurrency controller as its latency sample. `None` is
-    /// reserved for releases without a confirmed run.
     PermitReleased {
         kinds: SmallVec<[UserPermitKind; 1]>,
-        held_for: Option<Duration>,
     },
     /// A batch of rule mutations to apply in order. Carries `Vec` rather
     /// than a single `RuleUpdate` so initial seeding and bulk rule-book
@@ -44,9 +37,9 @@ pub enum ResourceManagerUpdate {
 
 /// Lifecycle signal for chain admission. A *chain* is a root invocation
 /// (one that no other invocation called) together with everything it
-/// calls. The partition leader emits these from the state machine; the
-/// scheduler turns them into chain permits and the end-to-end latency
-/// samples that drive automatic admission control.
+/// calls. Roots are marked durably on their vqueue entry
+/// (`EntryMetadata::chain_root`); the partition leader emits these signals
+/// for the transitions the scheduler cannot observe itself.
 #[derive(Debug, Clone)]
 pub struct ChainSignal {
     pub entry_id: EntryId,
@@ -55,16 +48,11 @@ pub struct ChainSignal {
 
 #[derive(Debug, Clone)]
 pub enum ChainSignalKind {
-    /// A root invocation was enqueued for its first run: it needs a chain
-    /// permit before it may start.
-    NewStart { root: ServiceName },
-    /// The root suspended on an external future (awakeable, sleep, promise,
-    /// signal): the chain consumes nothing downstream, so its permit is
-    /// released and its clock paused.
+    /// The root stopped consuming anything downstream: it suspended on an
+    /// external future (awakeable, sleep, promise, signal) or was paused.
+    /// Its permit is released and its clock paused; it is re-admitted (ahead
+    /// of new starts) when it runs again.
     Pause,
-    /// The root is back in the inbox after an external wait: it needs a chain
-    /// permit again, ahead of new starts.
-    ResumeExternal,
     /// The root reached a terminal state. `completed` selects whether the
     /// chain's active time becomes a latency sample.
     End { completed: bool },
@@ -118,10 +106,6 @@ pub struct ReservedResources {
     resources: SmallVec<[UserPermitKind; 1]>,
     system_permit: SystemPermit,
     manager_tx: Option<mpsc::UnboundedSender<ResourceManagerUpdate>>,
-    /// Set at permit build (run confirmation); the drop computes the permit
-    /// hold time from it. Uses `tokio::time::Instant` so tests can pause and
-    /// advance time.
-    acquired_at: Instant,
 }
 
 impl ReservedResources {
@@ -131,7 +115,6 @@ impl ReservedResources {
             resources: SmallVec::new(),
             system_permit: SystemPermit::default(),
             manager_tx: None,
-            acquired_at: Instant::now(),
         }
     }
 
@@ -146,7 +129,6 @@ impl ReservedResources {
             resources,
             system_permit,
             manager_tx: Some(manager_tx),
-            acquired_at: Instant::now(),
         }
     }
 
@@ -168,7 +150,6 @@ impl Drop for ReservedResources {
         {
             let _ = manager_tx.send(ResourceManagerUpdate::PermitReleased {
                 kinds: self.resources.drain(..).collect(),
-                held_for: Some(self.acquired_at.elapsed()),
             });
         }
     }

@@ -25,6 +25,20 @@ pub fn generate_vqueue_id(
     service_name: &str,
     key: Option<&str>,
 ) -> VQueueId {
+    generate_vqueue_id_with_root(partition_key, scope, limit_key, is_exclusive, service_name, key, false)
+}
+
+/// Like [`generate_vqueue_id`]; `chain_root` separates chain-root traffic of a
+/// service from its child calls (different hash, same partition).
+pub fn generate_vqueue_id_with_root(
+    partition_key: PartitionKey,
+    scope: Option<&Scope>,
+    limit_key: &LimitKey<ReString>,
+    is_exclusive: bool,
+    service_name: &str,
+    key: Option<&str>,
+    chain_root: bool,
+) -> VQueueId {
     const SEP_CHAR: u8 = 0xFF;
     // separator is 0xFF. (notation: `||`)
     const HASH_SEPARATOR: &[u8] = &[SEP_CHAR];
@@ -94,6 +108,11 @@ pub fn generate_vqueue_id(
         hasher.update(key);
     }
 
+    if chain_root {
+        hasher.update(HASH_SEPARATOR);
+        hasher.update(b"root");
+    }
+
     let bytes = hasher.finalize();
 
     VQueueId::new(partition_key, &bytes)
@@ -138,5 +157,72 @@ pub fn infer_vqueue_id_from_invocation(
             // Workflows behave like shared services.
             generate_vqueue_id(partition_key, scope.as_ref(), limit_key, false, name, None)
         }
+    }
+}
+
+/// vqueue id for a chain root (non-exclusive targets only; exclusive Virtual
+/// Object roots keep their per-key queue).
+pub fn infer_root_vqueue_id_from_invocation(
+    partition_key: PartitionKey,
+    invocation_target: &InvocationTarget,
+    limit_key: &LimitKey<ReString>,
+) -> VQueueId {
+    match invocation_target {
+        InvocationTarget::Service { name, scope, .. }
+        | InvocationTarget::Workflow { name, scope, .. } => generate_vqueue_id_with_root(
+            partition_key,
+            scope.as_ref(),
+            limit_key,
+            false,
+            name,
+            None,
+            true,
+        ),
+        InvocationTarget::VirtualObject {
+            handler_ty: VirtualObjectHandlerType::Shared,
+            name,
+            scope,
+            ..
+        } => generate_vqueue_id_with_root(
+            partition_key,
+            scope.as_ref(),
+            limit_key,
+            false,
+            name,
+            None,
+            true,
+        ),
+        InvocationTarget::VirtualObject { .. } => {
+            infer_vqueue_id_from_invocation(partition_key, invocation_target, limit_key)
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod chain_root_tests {
+    use super::*;
+    use restate_types::invocation::InvocationTarget;
+
+    /// Roots of non-exclusive targets get their own vqueue (no head-of-line
+    /// blocking of child calls behind a root parked on its chain permit);
+    /// exclusive Virtual Object roots keep the per-key queue.
+    #[test]
+    fn root_queues_are_separate_except_exclusive_vos() {
+        let lk = LimitKey::None;
+        let svc = InvocationTarget::service("Svc", "h");
+        let wf = InvocationTarget::workflow("Wf", "k", "run", restate_types::invocation::WorkflowHandlerType::Workflow);
+        let vo = InvocationTarget::virtual_object("Vo", "k", "h", VirtualObjectHandlerType::Exclusive);
+        for t in [&svc, &wf] {
+            assert_ne!(
+                infer_vqueue_id_from_invocation(7, t, &lk),
+                infer_root_vqueue_id_from_invocation(7, t, &lk)
+            );
+        }
+        assert_eq!(
+            infer_vqueue_id_from_invocation(7, &vo, &lk),
+            infer_root_vqueue_id_from_invocation(7, &vo, &lk),
+            "exclusive VO roots keep their per-key queue"
+        );
     }
 }

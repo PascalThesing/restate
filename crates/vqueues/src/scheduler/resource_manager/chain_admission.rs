@@ -15,7 +15,17 @@
 //! active end-to-end time and whose limit caps chains in progress. A chain
 //! permit is held for the chain's lifetime — never re-acquired on resume —
 //! so a parent can never wait behind its own cap. While the root waits on an
-//! external future the permit is released and the clock paused.
+//! external future (or is paused) the permit is released and the clock paused.
+//!
+//! Roots are recognised from the durable `EntryMetadata::chain_root` marker,
+//! so a new leader gates the backlog it inherits. Chains that were already
+//! under way are admitted unconditionally when they next run (and counted), so
+//! new starts wait until they drain. Roots live in their own vqueues, so a
+//! blocked root never sits in front of a child call to the same service.
+//!
+//! No sojourn backstop here: the root queue's sojourn is backlog age, not a
+//! congestion signal; downstream queueing is already inside the chain's
+//! end-to-end time.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
@@ -57,7 +67,7 @@ impl Default for ChainAdmissionConfig {
 }
 
 pub(super) enum Admit {
-    /// Not a gated entry (child, unknown, or admission disabled).
+    /// Not a gated entry (child, running chain, or admission disabled).
     NotGated,
     /// Admitted; the caller records the entry in its permit for revert.
     Admitted,
@@ -65,20 +75,9 @@ pub(super) enum Admit {
     Blocked(ServiceName),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mark {
-    NewStart,
-    ResumeExternal,
-}
-
-struct Pending {
-    root: ServiceName,
-    mark: Mark,
-}
-
 struct Held {
     root: ServiceName,
-    /// `None` while paused on an external wait.
+    /// `None` while paused (external wait or paused invocation).
     segment_started: Option<Instant>,
     active: Duration,
 }
@@ -95,7 +94,6 @@ pub(super) struct ChainAdmission {
     partition_label: String,
     controllers: HashMap<ServiceName, Gradient2Controller>,
     roots: HashMap<ServiceName, RootState>,
-    pending: HashMap<EntryId, Pending>,
     held: HashMap<EntryId, Held>,
 }
 
@@ -106,7 +104,6 @@ impl ChainAdmission {
             partition_label,
             controllers: HashMap::new(),
             roots: HashMap::new(),
-            pending: HashMap::new(),
             held: HashMap::new(),
         }
     }
@@ -142,39 +139,47 @@ impl ChainAdmission {
         self.roots.get_mut(root).expect("inserted above")
     }
 
-    /// Admission check for the inbox head of `vqueue`.
+    /// Admission check for the inbox head of `vqueue`. `chain_root` is the
+    /// entry's durable root marker; `first_run` is false for resumes.
     pub(super) fn poll_admit(
         &mut self,
         vqueue: VQueueHandle,
         entry_id: EntryId,
-        sojourn: Duration,
+        chain_root: Option<&str>,
+        first_run: bool,
         now: Instant,
     ) -> Admit {
         if !self.cfg.enabled {
             return Admit::NotGated;
         }
-        let Some(pending) = self.pending.get(&entry_id) else {
+        let Some(root_name) = chain_root else {
             return Admit::NotGated;
         };
-        let root = pending.root.clone();
-        let mark = pending.mark;
-
-        let limit = {
-            let controller = self.controller(&root, now);
-            controller.on_sojourn(sojourn, now);
-            controller.current_limit().get()
-        };
+        // A chain that holds its permit (resume after a child call, retry of a
+        // running attempt) is never gated again.
+        if self
+            .held
+            .get(&entry_id)
+            .is_some_and(|h| h.segment_started.is_some())
+        {
+            return Admit::NotGated;
+        }
+        let root = ServiceName::new(root_name);
+        let limit = self.controller(&root, now).current_limit().get();
+        // A chain already under way that this leader has never seen (leader
+        // change, restart) is admitted unconditionally: it may hold children
+        // downstream, and gating it would make it wait behind its own cap.
+        // The overshoot is bounded by the chains in flight and drains as they end.
+        let top_up = !first_run && !self.held.contains_key(&entry_id);
         let state = self.root_state(&root);
-        if state.in_progress < limit {
+        if top_up || state.in_progress < limit {
             state.in_progress += 1;
-            // A woken waiter that made it here is no longer waiting.
             if let Some(pos) = state.waiters.iter().position(|h| *h == vqueue) {
                 state.waiters.remove(pos);
             }
             state.report_waiters();
-            self.pending.remove(&entry_id);
             match self.held.get_mut(&entry_id) {
-                // resuming after an external wait: the clock restarts
+                // back from an external wait: the clock restarts
                 Some(held) => held.segment_started = Some(now),
                 None => {
                     self.held.insert(
@@ -190,10 +195,11 @@ impl ChainAdmission {
             return Admit::Admitted;
         }
         if !state.waiters.contains(&vqueue) {
-            match mark {
-                // an external resume goes ahead of new starts
-                Mark::ResumeExternal => state.waiters.push_front(vqueue),
-                Mark::NewStart => state.waiters.push_back(vqueue),
+            // a chain already under way goes ahead of new starts
+            if first_run {
+                state.waiters.push_back(vqueue);
+            } else {
+                state.waiters.push_front(vqueue);
             }
             state.report_waiters();
         }
@@ -210,35 +216,31 @@ impl ChainAdmission {
     }
 
     /// An admitted entry never started (its assignment was reverted): give the
-    /// permit back and let the entry be admitted again later.
+    /// permit back; the entry is admitted again on its next attempt.
     pub(super) fn release_unstarted(&mut self, entry_id: EntryId, woken: &mut Vec<VQueueHandle>) {
         let Some(held) = self.held.get_mut(&entry_id) else {
             return;
         };
         let root = held.root.clone();
-        let resumed = held.active > Duration::ZERO;
         held.segment_started = None;
-        if !resumed {
+        if held.active == Duration::ZERO {
             self.held.remove(&entry_id);
         }
-        self.pending.insert(
-            entry_id,
-            Pending {
-                root: root.clone(),
-                mark: if resumed {
-                    Mark::ResumeExternal
-                } else {
-                    Mark::NewStart
-                },
-            },
-        );
-        self.free_slot(&root, 1, woken);
+        self.free_slot(&root, woken);
     }
 
-    fn free_slot(&mut self, root: &ServiceName, n: usize, woken: &mut Vec<VQueueHandle>) {
+    fn free_slot(&mut self, root: &ServiceName, woken: &mut Vec<VQueueHandle>) {
+        let limit = self
+            .controllers
+            .get(root)
+            .map(|c| c.current_limit().get())
+            .unwrap_or(1);
         let state = self.root_state(root);
         state.in_progress = state.in_progress.saturating_sub(1);
-        for _ in 0..n {
+        // wake up to the headroom, not just one: a stale waiter must never
+        // leave a free slot idle
+        let headroom = limit.saturating_sub(state.in_progress).max(1) as usize;
+        for _ in 0..headroom {
             match state.waiters.pop_front() {
                 Some(h) => woken.push(h),
                 None => break,
@@ -254,41 +256,16 @@ impl ChainAdmission {
         }
         let entry_id = signal.entry_id;
         match signal.kind {
-            ChainSignalKind::NewStart { root } => {
-                if !self.held.contains_key(&entry_id) {
-                    self.pending.insert(
-                        entry_id,
-                        Pending {
-                            root,
-                            mark: Mark::NewStart,
-                        },
-                    );
-                }
-            }
             ChainSignalKind::Pause => {
                 if let Some(held) = self.held.get_mut(&entry_id)
                     && let Some(started) = held.segment_started.take()
                 {
                     held.active += now.saturating_duration_since(started);
                     let root = held.root.clone();
-                    self.free_slot(&root, 1, &mut woken);
-                }
-            }
-            ChainSignalKind::ResumeExternal => {
-                if let Some(held) = self.held.get(&entry_id)
-                    && held.segment_started.is_none()
-                {
-                    self.pending.insert(
-                        entry_id,
-                        Pending {
-                            root: held.root.clone(),
-                            mark: Mark::ResumeExternal,
-                        },
-                    );
+                    self.free_slot(&root, &mut woken);
                 }
             }
             ChainSignalKind::End { completed } => {
-                self.pending.remove(&entry_id);
                 let Some(held) = self.held.remove(&entry_id) else {
                     return woken;
                 };
@@ -299,11 +276,11 @@ impl ChainAdmission {
                         .segment_started
                         .map(|s| now.saturating_duration_since(s))
                         .unwrap_or_default();
-                // in-flight as seen by the controller: chains in progress
+                // in-flight as the controller sees it: chains in progress
                 // including this one, at completion.
                 let in_flight = self.root_state(&root).in_progress;
                 if was_running {
-                    self.free_slot(&root, 1, &mut woken);
+                    self.free_slot(&root, &mut woken);
                 }
                 if completed && active <= self.cfg.sample_max {
                     let outcome = self.controller(&root, now).on_sample(active, in_flight, now);
@@ -349,6 +326,8 @@ mod tests {
     use super::*;
     use slotmap::SlotMap;
 
+    const ROOT: &str = "Root";
+
     fn cfg(min: u32, max: u32) -> ChainAdmissionConfig {
         ChainAdmissionConfig {
             enabled: true,
@@ -371,75 +350,99 @@ mod tests {
     }
 
     fn root() -> ServiceName {
-        ServiceName::new("Root")
+        ServiceName::new(ROOT)
     }
 
     fn signal(e: EntryId, kind: ChainSignalKind) -> ChainSignal {
         ChainSignal { entry_id: e, kind }
     }
 
-    /// The permit is held across the whole chain: a second start is blocked
-    /// while the first is in progress (limit 1), and freed by End — not by
-    /// any attempt boundary in between.
+    /// The permit spans the chain: a second root is blocked while the first is
+    /// in progress, the first's resume after a child call is never gated, and
+    /// End frees the slot. Children (no root marker) are never gated.
     #[test]
     fn permit_spans_the_chain_and_frees_on_end() {
         let mut handles = SlotMap::<VQueueHandle, ()>::with_key();
-        let q1 = handles.insert(());
-        let q2 = handles.insert(());
+        let (q1, q2) = (handles.insert(()), handles.insert(()));
         let now = Instant::now();
         let mut adm = ChainAdmission::new(cfg(1, 1), "p".into());
         let (e1, e2) = (entry(1), entry(2));
 
-        adm.on_signal(signal(e1, ChainSignalKind::NewStart { root: root() }), now);
-        adm.on_signal(signal(e2, ChainSignalKind::NewStart { root: root() }), now);
-        assert!(matches!(adm.poll_admit(q1, e1, Duration::ZERO, now), Admit::Admitted));
-        assert!(matches!(adm.poll_admit(q2, e2, Duration::ZERO, now), Admit::Blocked(_)));
+        assert!(matches!(adm.poll_admit(q1, e1, Some(ROOT), true, now), Admit::Admitted));
+        assert!(matches!(adm.poll_admit(q2, e2, Some(ROOT), true, now), Admit::Blocked(_)));
+        // e1 suspends awaiting a child and comes back: not re-gated
+        assert!(matches!(adm.poll_admit(q1, e1, Some(ROOT), false, now), Admit::NotGated));
+        // a child is never gated
+        assert!(matches!(adm.poll_admit(q2, entry(99), None, true, now), Admit::NotGated));
         assert_eq!(adm.in_progress(&root()), 1);
 
-        // a child of e1 is never gated
-        assert!(matches!(adm.poll_admit(q2, entry(99), Duration::ZERO, now), Admit::NotGated));
-
-        let woken = adm.on_signal(signal(e1, ChainSignalKind::End { completed: true }), now + Duration::from_millis(500));
+        let woken = adm.on_signal(
+            signal(e1, ChainSignalKind::End { completed: true }),
+            now + Duration::from_millis(500),
+        );
         assert_eq!(woken, vec![q2], "End frees the slot and wakes the waiter");
-        assert!(matches!(adm.poll_admit(q2, e2, Duration::ZERO, now), Admit::Admitted));
+        assert!(matches!(adm.poll_admit(q2, e2, Some(ROOT), true, now), Admit::Admitted));
     }
 
     /// An external wait reopens the slot and stops the clock; the resume needs
     /// a permit again but goes ahead of new starts.
     #[test]
-    fn external_wait_reopens_slot_and_pauses_clock() {
+    fn external_wait_reopens_slot_and_resume_goes_first() {
         let mut handles = SlotMap::<VQueueHandle, ()>::with_key();
-        let q1 = handles.insert(());
-        let q2 = handles.insert(());
-        let q3 = handles.insert(());
+        let (q1, q2, q3) = (handles.insert(()), handles.insert(()), handles.insert(()));
         let t0 = Instant::now();
         let mut adm = ChainAdmission::new(cfg(1, 1), "p".into());
         let (e1, e2, e3) = (entry(1), entry(2), entry(3));
 
-        adm.on_signal(signal(e1, ChainSignalKind::NewStart { root: root() }), t0);
-        assert!(matches!(adm.poll_admit(q1, e1, Duration::ZERO, t0), Admit::Admitted));
-        adm.on_signal(signal(e2, ChainSignalKind::NewStart { root: root() }), t0);
-        assert!(matches!(adm.poll_admit(q2, e2, Duration::ZERO, t0), Admit::Blocked(_)));
+        assert!(matches!(adm.poll_admit(q1, e1, Some(ROOT), true, t0), Admit::Admitted));
+        assert!(matches!(adm.poll_admit(q2, e2, Some(ROOT), true, t0), Admit::Blocked(_)));
 
-        // e1 waits on an awakeable: slot reopened, e2 woken
         let woken = adm.on_signal(signal(e1, ChainSignalKind::Pause), t0 + Duration::from_millis(100));
         assert_eq!(woken, vec![q2]);
         assert_eq!(adm.in_progress(&root()), 0);
-        assert!(matches!(adm.poll_admit(q2, e2, Duration::ZERO, t0), Admit::Admitted));
+        assert!(matches!(adm.poll_admit(q2, e2, Some(ROOT), true, t0), Admit::Admitted));
 
-        // the awakeable resolves: e1 must re-acquire, and it queues AHEAD of e3
-        adm.on_signal(signal(e3, ChainSignalKind::NewStart { root: root() }), t0);
-        assert!(matches!(adm.poll_admit(q3, e3, Duration::ZERO, t0), Admit::Blocked(_)));
-        adm.on_signal(signal(e1, ChainSignalKind::ResumeExternal), t0 + Duration::from_secs(30));
-        assert!(matches!(adm.poll_admit(q1, e1, Duration::ZERO, t0), Admit::Blocked(_)));
-        let woken = adm.on_signal(signal(e2, ChainSignalKind::End { completed: true }), t0 + Duration::from_secs(31));
-        assert_eq!(woken, vec![q1], "external resume is served before the new start");
+        // a new start queues, then e1's awakeable resolves: e1 queues AHEAD
+        assert!(matches!(adm.poll_admit(q3, e3, Some(ROOT), true, t0), Admit::Blocked(_)));
+        assert!(matches!(
+            adm.poll_admit(q1, e1, Some(ROOT), false, t0 + Duration::from_secs(30)),
+            Admit::Blocked(_)
+        ), "a paused chain this leader knows re-queues (no top-up)");
+        let woken = adm.on_signal(
+            signal(e2, ChainSignalKind::End { completed: true }),
+            t0 + Duration::from_secs(31),
+        );
+        assert_eq!(woken, vec![q1], "the resuming chain is served before the new start");
+        assert!(matches!(
+            adm.poll_admit(q1, e1, Some(ROOT), false, t0 + Duration::from_secs(31)),
+            Admit::Admitted
+        ));
+        assert_eq!(
+            adm.held.get(&e1).map(|h| h.active),
+            Some(Duration::from_millis(100)),
+            "the 30s external wait is not active time"
+        );
+    }
 
-        // e1 runs 200ms more, then ends: the 30s wait is not in the sample
-        assert!(matches!(adm.poll_admit(q1, e1, Duration::ZERO, t0 + Duration::from_secs(31)), Admit::Admitted));
-        adm.on_signal(signal(e1, ChainSignalKind::End { completed: true }), t0 + Duration::from_secs(31) + Duration::from_millis(200));
-        let held_active = adm.held.get(&e1).map(|h| h.active);
-        assert!(held_active.is_none(), "chain released on end");
+    /// After a leader change the scheduler holds no state: the inherited
+    /// backlog is still gated (durable root marker), while chains already under
+    /// way are admitted unconditionally (they must never wait behind their own
+    /// cap) and counted, so new starts wait until they drain.
+    #[test]
+    fn inherited_backlog_is_gated_after_leader_change() {
+        let mut handles = SlotMap::<VQueueHandle, ()>::with_key();
+        let (q_new, q_mid, q_new2) = (handles.insert(()), handles.insert(()), handles.insert(()));
+        let now = Instant::now();
+        let mut adm = ChainAdmission::new(cfg(1, 1), "p".into());
+        assert!(matches!(adm.poll_admit(q_new, entry(1), Some(ROOT), true, now), Admit::Admitted));
+        assert!(matches!(adm.poll_admit(q_mid, entry(3), Some(ROOT), false, now), Admit::Admitted));
+        assert_eq!(adm.in_progress(&root()), 2, "the top-up is counted");
+        assert!(matches!(adm.poll_admit(q_new2, entry(2), Some(ROOT), true, now), Admit::Blocked(_)));
+        adm.on_signal(signal(entry(1), ChainSignalKind::End { completed: true }), now);
+        assert!(matches!(adm.poll_admit(q_new2, entry(2), Some(ROOT), true, now), Admit::Blocked(_)),
+            "still over the limit until the inherited chain drains");
+        let woken = adm.on_signal(signal(entry(3), ChainSignalKind::End { completed: true }), now);
+        assert_eq!(woken, vec![q_new2]);
     }
 
     /// A reverted (never started) admission is given back and re-admittable.
@@ -450,24 +453,21 @@ mod tests {
         let now = Instant::now();
         let mut adm = ChainAdmission::new(cfg(1, 1), "p".into());
         let e1 = entry(1);
-        adm.on_signal(signal(e1, ChainSignalKind::NewStart { root: root() }), now);
-        assert!(matches!(adm.poll_admit(q1, e1, Duration::ZERO, now), Admit::Admitted));
+        assert!(matches!(adm.poll_admit(q1, e1, Some(ROOT), true, now), Admit::Admitted));
         let mut woken = Vec::new();
         adm.release_unstarted(e1, &mut woken);
         assert_eq!(adm.in_progress(&root()), 0);
-        assert!(matches!(adm.poll_admit(q1, e1, Duration::ZERO, now), Admit::Admitted));
+        assert!(matches!(adm.poll_admit(q1, e1, Some(ROOT), true, now), Admit::Admitted));
     }
 
-    /// Disabled admission gates nothing and ignores signals.
+    /// Disabled admission gates nothing.
     #[test]
     fn disabled_is_transparent() {
         let mut handles = SlotMap::<VQueueHandle, ()>::with_key();
         let q1 = handles.insert(());
         let now = Instant::now();
         let mut adm = ChainAdmission::new(ChainAdmissionConfig::default(), "p".into());
-        let e1 = entry(1);
-        adm.on_signal(signal(e1, ChainSignalKind::NewStart { root: root() }), now);
-        assert!(matches!(adm.poll_admit(q1, e1, Duration::ZERO, now), Admit::NotGated));
+        assert!(matches!(adm.poll_admit(q1, entry(1), Some(ROOT), true, now), Admit::NotGated));
         assert!(adm.current_limit(&root()).is_none());
     }
 }

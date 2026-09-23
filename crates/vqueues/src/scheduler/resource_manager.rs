@@ -119,7 +119,7 @@ impl ResourceManager {
             ),
             invoker_throttling: InvokerThrottlingLimiter::new(global_throttling),
             invoker_memory: InvokerMemoryLimiter::new(memory_pool, initial_invocation_memory),
-            user_limiter: UserLimiter::create(partition_label.clone()),
+            user_limiter: UserLimiter::create(),
             chain: ChainAdmission::new(chain_config, partition_label),
             locks,
             rx,
@@ -231,7 +231,8 @@ impl ResourceManager {
         vqueue: VQueueHandle,
         meta: &VQueueMeta,
         key: &EntryKey,
-        _metadata: &EntryMetadata,
+        metadata: &EntryMetadata,
+        first_run: bool,
         current_permit: &mut PermitBuilder,
     ) -> AcquireOutcome {
         if !current_permit.has_user_permit() {
@@ -261,37 +262,11 @@ impl ResourceManager {
                 }
             }
 
-            // Time the head entry has been runnable in the durable queue.
-            let sojourn = restate_clock::RoughTimestamp::now().duration_since(key.run_at());
-
-            // Chain admission: a root invocation needs a chain permit before
-            // its first run (and again after an external wait). Children and
-            // resumes after internal waits are never gated here.
-            if key.kind() == EntryKind::Invocation {
-                match self.chain.poll_admit(
-                    vqueue,
-                    *key.entry_id(),
-                    sojourn,
-                    tokio::time::Instant::now(),
-                ) {
-                    Admit::NotGated => {}
-                    Admit::Admitted => provisional.set_chain_entry(*key.entry_id()),
-                    Admit::Blocked(root) => {
-                        trace!(root = %root, "Chain admission limit reached");
-                        return AcquireOutcome::BlockedOn(ResourceKind::ChainAdmission { root });
-                    }
-                }
-            }
-
             // unscoped entries cannot acquire user limits
             if let Some(scope) = meta.scope() {
-                // Single-lookup path: feeds the acquire-side sojourn to the
-                // adaptive CoDel backstop AND checks capacity in one trie walk.
-                let capacity = self.user_limiter.check_concurrency_capacity_observing(
-                    scope,
-                    meta.limit_key(),
-                    sojourn,
-                );
+                let capacity = self
+                    .user_limiter
+                    .check_concurrency_capacity(scope, meta.limit_key());
                 if let Some((blocked_level, blocked_rule)) = capacity.narrowest_blocked() {
                     trace!(
                         %scope,
@@ -319,6 +294,27 @@ impl ResourceManager {
                     scope.clone(),
                     meta.limit_key().clone(),
                 ));
+            }
+
+            // Chain admission (last user check, so a permit is only taken when
+            // everything else is available): a root invocation needs a chain permit before
+            // its first run (and again after an external wait or a pause).
+            // Children and resumes of a running chain are never gated here.
+            if key.kind() == EntryKind::Invocation {
+                match self.chain.poll_admit(
+                    vqueue,
+                    *key.entry_id(),
+                    metadata.chain_root.as_deref(),
+                    first_run,
+                    tokio::time::Instant::now(),
+                ) {
+                    Admit::NotGated => {}
+                    Admit::Admitted => provisional.set_chain_entry(*key.entry_id()),
+                    Admit::Blocked(root) => {
+                        trace!(root = %root, "Chain admission limit reached");
+                        return AcquireOutcome::BlockedOn(ResourceKind::ChainAdmission { root });
+                    }
+                }
             }
 
             // All user requirements are satisfied.
@@ -382,16 +378,12 @@ impl ResourceManager {
         // drain as many updates as possible
         while let Poll::Ready(Some(update)) = self.rx.poll_recv(cx) {
             match update {
-                ResourceManagerUpdate::PermitReleased { kinds, held_for } => {
+                ResourceManagerUpdate::PermitReleased { kinds } => {
                     for resource in kinds {
                         match resource {
                             UserPermitKind::LimitKeyConcurrency(scope, limit_key) => {
-                                // held_for feeds the adaptive controller as its
-                                // latency sample; revert-path releases carry None
-                                // and stay sample-free.
-                                let woken = self
-                                    .user_limiter
-                                    .on_permit_released(&scope, &limit_key, held_for);
+                                let woken =
+                                    self.user_limiter.release_concurrency(&scope, &limit_key);
                                 eligible.wake_up_queues(woken);
                             }
                         }

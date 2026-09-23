@@ -631,12 +631,11 @@ where
                 feature_changes.push(PartitionFeatureChange::EnableScopeInheritance);
             }
 
-            // Scoped children derive per-service limit keys so sub-bulkhead
-            // rules (e.g. tenant/OrderService) bind without SDK changes.
-            if config.common.experimental.is_limit_key_derivation_enabled()
-                && !state_machine_features.is_limit_key_derivation_enabled()
+            // Chain admission needs roots in their own vqueues, marked durably.
+            if config.worker.invoker.chain_admission.enabled
+                && !state_machine_features.is_chain_root_queues_enabled()
             {
-                feature_changes.push(PartitionFeatureChange::EnableLimitKeyDerivation);
+                feature_changes.push(PartitionFeatureChange::EnableChainRootQueues);
             }
 
             if !feature_changes.is_empty() {
@@ -1051,9 +1050,10 @@ mod tests {
             false
         }
 
-        fn is_limit_key_derivation_enabled(&self) -> bool {
+        fn is_chain_root_queues_enabled(&self) -> bool {
             false
         }
+
     }
 
     #[test(restate_core::test)]

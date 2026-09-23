@@ -39,12 +39,9 @@ pub trait PartitionFeatures {
     ///
     /// *Since v1.7.0*
     fn is_scope_inheritance_enabled(&self) -> bool;
+    /// Chain roots get their own vqueues and a chain-admission marker.
+    fn is_chain_root_queues_enabled(&self) -> bool;
 
-    /// Whether scoped child invocations without an explicit limit key derive
-    /// `limit_key = <target service name>`.
-    ///
-    /// *Since v1.7.0*
-    fn is_limit_key_derivation_enabled(&self) -> bool;
 }
 
 impl PartitionFeatures for PersistedFeatures {
@@ -68,10 +65,10 @@ impl PartitionFeatures for PersistedFeatures {
         self.scope_inheritance
     }
 
-    #[inline]
-    fn is_limit_key_derivation_enabled(&self) -> bool {
-        self.limit_key_derivation
+    fn is_chain_root_queues_enabled(&self) -> bool {
+        self.chain_root_queues
     }
+
 }
 
 // -- Boilerplate --
@@ -93,9 +90,10 @@ impl<T: PartitionFeatures> PartitionFeatures for &T {
         (**self).is_scope_inheritance_enabled()
     }
 
-    fn is_limit_key_derivation_enabled(&self) -> bool {
-        (**self).is_limit_key_derivation_enabled()
+    fn is_chain_root_queues_enabled(&self) -> bool {
+        (**self).is_chain_root_queues_enabled()
     }
+
 }
 
 impl<T: PartitionFeatures> PartitionFeatures for &mut T {
@@ -115,7 +113,8 @@ impl<T: PartitionFeatures> PartitionFeatures for &mut T {
         (**self).is_scope_inheritance_enabled()
     }
 
-    fn is_limit_key_derivation_enabled(&self) -> bool {
-        (**self).is_limit_key_derivation_enabled()
+    fn is_chain_root_queues_enabled(&self) -> bool {
+        (**self).is_chain_root_queues_enabled()
     }
+
 }

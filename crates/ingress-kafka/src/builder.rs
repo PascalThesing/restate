@@ -178,7 +178,7 @@ pub(crate) fn extract_scope_limit_key(
     };
 
     let mut scope = None;
-    let mut limit_key = LimitKey::None;
+    let limit_key = LimitKey::None;
 
     for idx in 0..kafka_headers.count() {
         let header = kafka_headers.get(idx);
@@ -191,13 +191,6 @@ pub(crate) fn extract_scope_limit_key(
                     && !s.is_empty()
                 {
                     scope = Some(Scope::try_new(s)?);
-                }
-            }
-            "x-restate-limit-key" => {
-                if let Ok(s) = std::str::from_utf8(value)
-                    && let Ok(lk) = s.parse()
-                {
-                    limit_key = lk;
                 }
             }
             _ => {}
