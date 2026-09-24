@@ -14,6 +14,7 @@ use restate_futures_util::concurrency::Permit;
 use restate_storage_api::vqueue_table::EntryMetadata;
 use restate_types::vqueues::EntryId;
 use restate_types::{LockName, Scope};
+use restate_worker_api::invoker::slot_shares::SlotLease;
 use restate_worker_api::resources::{
     ReservedResources, SystemPermit, ThrottlingToken, UserPermitKind,
 };
@@ -44,8 +45,9 @@ impl PermitBuilder {
         self.system_permit.throttling_permit.is_some()
     }
 
-    pub fn set_invoker_permit(&mut self, invoker_permit: Permit) {
+    pub fn set_invoker_permit(&mut self, invoker_permit: Permit, slot_lease: SlotLease) {
         self.system_permit.invoker_permit = invoker_permit;
+        self.system_permit.slot_lease = slot_lease;
     }
 
     pub fn set_throttling_permit(&mut self, throttling_permit: ThrottlingToken) {

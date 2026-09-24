@@ -28,6 +28,7 @@ bytes = { workspace = true }
 codederror = { workspace = true }
 futures = { workspace = true }
 gardal = { workspace = true, features = ["tokio"] }
+metrics = { workspace = true }
 serde = { workspace = true, optional = true }
 derive_more = { workspace = true, features = ["display"] }
 serde_with = { workspace = true, optional = true }

@@ -729,6 +729,7 @@ mod tests {
             // chain admission stays off in the scheduler tests: they exercise
             // rules, weights and lanes; chain_admission.rs has its own tests
             crate::scheduler::ChainAdmissionConfig::default(),
+            restate_worker_api::invoker::slot_shares::SlotShares::disabled(),
         )
         .await
         .expect("resource manager creation should succeed")

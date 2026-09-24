@@ -517,6 +517,7 @@ where
                     lane_weight_resolver,
                     self.partition.partition_id.to_string(),
                     chain_config,
+                    self.invoker_capacity.slot_shares.clone(),
                 )
                 .await?,
                 partition_store.partition_db().clone(),
@@ -631,8 +632,10 @@ where
                 feature_changes.push(PartitionFeatureChange::EnableScopeInheritance);
             }
 
-            // Chain admission needs roots in their own vqueues, marked durably.
-            if config.worker.invoker.chain_admission.enabled
+            // Chain admission and weighted slot shares need roots in their own
+            // vqueues, marked durably (shares cap only a root's first run).
+            if (config.worker.invoker.chain_admission.enabled
+                || config.worker.invoker.weighted_slot_shares)
                 && !state_machine_features.is_chain_root_queues_enabled()
             {
                 feature_changes.push(PartitionFeatureChange::EnableChainRootQueues);

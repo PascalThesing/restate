@@ -34,6 +34,7 @@ mod invoker_memory;
 mod invoker_throttle;
 mod locks;
 mod permit;
+mod share_gate;
 mod user_limiter;
 
 pub use self::chain_admission::ChainAdmissionConfig;
@@ -58,6 +59,7 @@ use restate_types::identifiers::PartitionKey;
 use restate_types::vqueues::EntryKind;
 use restate_types::{LockName, Scope};
 use restate_util_string::ReString;
+use restate_worker_api::invoker::slot_shares::SlotShares;
 use restate_worker_api::resources::{ChainSignal, ResourceManagerUpdate, UserPermitKind};
 use restate_worker_api::{ResourceKind, UserLimitCounterEntry};
 
@@ -67,6 +69,7 @@ use self::invoker_memory::InvokerMemoryLimiter;
 use self::invoker_throttle::{InvokerThrottlingLimiter, ThrottlingAcquire};
 use self::locks::Locks;
 use self::permit::ProvisionalPermit;
+use self::share_gate::ShareGate;
 use self::user_limiter::UserLimiter;
 use super::VQueueHandle;
 use super::eligible::{EligibilityTracker, SchedulingGroup, WeightResolver, LaneWeightResolver};
@@ -84,6 +87,8 @@ pub struct ResourceManager {
     invoker_memory: InvokerMemoryLimiter,
     user_limiter: UserLimiter,
     chain: ChainAdmission,
+    /// Weighted slot shares for new chain starts, enforced before the invoker.
+    share_gate: ShareGate,
     rx: mpsc::UnboundedReceiver<ResourceManagerUpdate>,
     // We need to keep this alive to:
     // - Keep the receiver alive even if we don't have any resource permits handed out
@@ -106,6 +111,7 @@ impl ResourceManager {
         lane_weight_resolver: LaneWeightResolver,
         partition_label: String,
         chain_config: ChainAdmissionConfig,
+        slot_shares: SlotShares,
     ) -> Result<Self, StorageError> {
         let locks = Locks::create(storage).await?;
 
@@ -116,7 +122,9 @@ impl ResourceManager {
                 concurrency_limiter,
                 weight_resolver,
                 lane_weight_resolver,
+                slot_shares.clone(),
             ),
+            share_gate: ShareGate::new(slot_shares),
             invoker_throttling: InvokerThrottlingLimiter::new(global_throttling),
             invoker_memory: InvokerMemoryLimiter::new(memory_pool, initial_invocation_memory),
             user_limiter: UserLimiter::create(),
@@ -169,6 +177,9 @@ impl ResourceManager {
             }
             ResourceKind::ChainAdmission { root } => {
                 self.chain.remove_waiter(handle, root);
+            }
+            ResourceKind::SlotShare { .. } => {
+                self.share_gate.remove(handle);
             }
         }
     }
@@ -336,15 +347,34 @@ impl ResourceManager {
                         .service_name()
                         .cloned()
                         .unwrap_or_else(super::eligible::unlinked_group);
-                    let Some(invoker_permit) = self.invoker_concurrency.poll_acquire(
+                    let group = SchedulingGroup::of(meta);
+                    // Weighted slot shares apply to new chain starts only;
+                    // in-flight chain work (children, resumes) is never
+                    // capped and is served first by the invoker.
+                    let new_start = first_run && metadata.chain_root.is_some();
+                    if self.share_gate.is_enabled() {
+                        if new_start {
+                            let lane = self.invoker_concurrency.lane_of(&group, &service);
+                            if !self.share_gate.admit(vqueue, lane.clone()) {
+                                self.invoker_concurrency.remove_from_waiters(vqueue);
+                                return AcquireOutcome::BlockedOn(ResourceKind::SlotShare {
+                                    lane: ReString::new(lane.0),
+                                });
+                            }
+                        } else {
+                            self.share_gate.remove(vqueue);
+                        }
+                    }
+                    let Some((invoker_permit, slot_lease)) = self.invoker_concurrency.poll_acquire(
                         cx,
                         vqueue,
-                        &SchedulingGroup::of(meta),
+                        &group,
                         &service,
+                        new_start,
                     ) else {
                         return AcquireOutcome::BlockedOn(ResourceKind::InvokerConcurrency);
                     };
-                    current_permit.set_invoker_permit(invoker_permit);
+                    current_permit.set_invoker_permit(invoker_permit, slot_lease);
                 }
 
                 // If we have the concurrency permit, let's see if we need to wait for throttling
@@ -409,6 +439,10 @@ impl ResourceManager {
             );
             eligible.wake_up_queue(queue);
         }
+
+        let mut share_woken = Vec::new();
+        self.share_gate.poll_wake(cx, &mut share_woken);
+        eligible.wake_up_queues(share_woken);
 
         while let Poll::Ready(Some(queue)) = self.invoker_throttling.poll_head(cx) {
             tracing::trace!(

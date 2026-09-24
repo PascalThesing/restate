@@ -371,6 +371,13 @@ pub struct InvokerOptions {
     /// learned from the chains' own end-to-end latency (Gradient2), without any
     /// rule. Weights (`restate rules set --weight`) keep deciding priority.
     pub chain_admission: ChainAdmissionOptions,
+    /// # Weighted slot shares
+    ///
+    /// When invoker slots are contended, each service may hold at most its
+    /// weighted share of this node's `concurrent-invocations-limit` (weight =
+    /// scope weight x service lane weight). Shares are water-filled, so no slot
+    /// idles while someone waits. Off by default.
+    pub weighted_slot_shares: bool,
 
     /// # Eager state size limit (since v1.7.0)
     ///
@@ -658,6 +665,7 @@ impl Default for InvokerOptions {
             tmp_dir: None,
             concurrent_invocations_limit: Some(NonZeroUsize::new(1000).expect("is non zero")),
             chain_admission: ChainAdmissionOptions::default(),
+            weighted_slot_shares: false,
             eager_state_size_limit: None,
             disable_eager_state: false,
             invocation_throttling: None,

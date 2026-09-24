@@ -114,6 +114,8 @@ pub enum ResourceKind {
     /// Waiting for a chain permit: the root service's automatic admission
     /// limit is fully used by chains in progress.
     ChainAdmission { root: ServiceName },
+    /// A new chain start waiting for its root lane's weighted slot share.
+    SlotShare { lane: ReString },
 }
 
 impl ResourceKind {
@@ -142,6 +144,7 @@ impl ResourceKind {
             ResourceKind::ChainAdmission { root } => BlockedResource::ChainAdmission {
                 root: ReString::new(root.to_string()),
             },
+            ResourceKind::SlotShare { lane } => BlockedResource::SlotShare { lane: lane.clone() },
             ResourceKind::LimitKeyConcurrency {
                 scope,
                 limit_key,
@@ -204,6 +207,8 @@ pub enum BlockedResource {
     },
     /// Waiting for a chain permit of the given root service.
     ChainAdmission { root: ReString },
+    /// A new chain start waiting for its lane's weighted slot share.
+    SlotShare { lane: ReString },
 }
 
 impl std::fmt::Display for BlockedResource {
@@ -221,6 +226,7 @@ impl std::fmt::Display for BlockedResource {
             BlockedResource::InvokerMemory => f.write_str("InvokerMemory"),
             BlockedResource::DeploymentConcurrency => f.write_str("DeploymentConcurrency"),
             BlockedResource::ChainAdmission { root } => write!(f, "ChainAdmission(root={root})"),
+            BlockedResource::SlotShare { lane } => write!(f, "SlotShare(lane={lane})"),
             BlockedResource::LimitKeyConcurrency {
                 scope,
                 limit_key,

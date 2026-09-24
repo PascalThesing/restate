@@ -14,6 +14,8 @@ use restate_futures_util::concurrency::Concurrency;
 use restate_memory::{MemoryPool, NonZeroByteCount};
 use restate_types::config::{DEFAULT_PER_INVOCATION_INITIAL_MEMORY, ThrottlingOptions};
 
+use super::slot_shares::SlotShares;
+
 pub type TokenBucket<C = gardal::TokioClock> = gardal::SharedTokenBucket<C>;
 
 #[derive(Clone)]
@@ -24,6 +26,8 @@ pub struct InvokerCapacity {
     pub memory_pool: MemoryPool,
     /// Outbound initial memory in bytes reserved from the memory pool per invocation.
     pub initial_invocation_memory: NonZeroByteCount,
+    /// Weighted shares of `concurrency`, node-wide (disabled unless configured).
+    pub slot_shares: SlotShares,
 }
 
 impl InvokerCapacity {
@@ -34,6 +38,7 @@ impl InvokerCapacity {
             action_token_bucket: None,
             memory_pool: MemoryPool::unlimited(),
             initial_invocation_memory: DEFAULT_PER_INVOCATION_INITIAL_MEMORY,
+            slot_shares: SlotShares::disabled(),
         }
     }
 
@@ -43,8 +48,10 @@ impl InvokerCapacity {
         action_throttling: Option<&ThrottlingOptions>,
         memory_pool: MemoryPool,
         initial_invocation_memory: NonZeroByteCount,
+        weighted_slot_shares: bool,
     ) -> Self {
         Self {
+            slot_shares: SlotShares::new(concurrency, weighted_slot_shares),
             concurrency: Concurrency::new(concurrency),
             invocation_token_bucket: invocation_throttling.map(|opts| {
                 TokenBucket::new(gardal::Limit::from(opts.clone()), gardal::TokioClock)

@@ -12,6 +12,8 @@ use smallvec::SmallVec;
 use tokio::sync::mpsc;
 
 use restate_futures_util::concurrency::Permit;
+
+use crate::invoker::slot_shares::SlotLease;
 use restate_limiter::LimitKey;
 use restate_memory::MemoryLease;
 use restate_storage_api::vqueue_table::EntryMetadata;
@@ -73,6 +75,8 @@ pub struct ThrottlingToken;
 #[non_exhaustive]
 pub struct SystemPermit {
     pub invoker_permit: Permit,
+    /// The lane's share of the invoker slot; dropped together with the permit.
+    pub slot_lease: SlotLease,
     pub throttling_permit: Option<ThrottlingToken>,
     pub memory_lease: MemoryLease,
 }
@@ -81,6 +85,7 @@ impl Default for SystemPermit {
     fn default() -> Self {
         Self {
             invoker_permit: Permit::new_empty(),
+            slot_lease: SlotLease::empty(),
             throttling_permit: None,
             memory_lease: MemoryLease::unlinked(),
         }
@@ -91,6 +96,7 @@ impl SystemPermit {
     pub fn take(&mut self) -> SystemPermit {
         SystemPermit {
             invoker_permit: self.invoker_permit.split(1).unwrap_or(Permit::new_empty()),
+            slot_lease: self.slot_lease.take(),
             throttling_permit: self.throttling_permit.take(),
             memory_lease: self.memory_lease.take(),
         }

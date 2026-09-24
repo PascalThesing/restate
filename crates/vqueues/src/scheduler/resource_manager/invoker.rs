@@ -14,23 +14,71 @@ use slotmap::SecondaryMap;
 
 use restate_futures_util::concurrency::{Concurrency, Permit};
 use restate_types::ServiceName;
+use restate_worker_api::invoker::slot_shares::{SlotLease, SlotShares};
 
 use super::grouped_waiters::GroupedWaiters;
 use crate::scheduler::VQueueHandle;
 use crate::scheduler::eligible::{LaneWeightResolver, SchedulingGroup, WeightResolver};
 
+/// Invoker slot limiter.
+///
+/// With weighted slot shares enabled, waiters are split in two classes:
+/// - **in-flight** work of chains that already run (children, resumes): served
+///   first, so a chain holding slots while it awaits its children always gets
+///   them run (no hold-and-wait on the pool);
+/// - **new chain starts** (a root's first run): served only when no in-flight
+///   work waits. Their weighted share is enforced *before* they get here, at
+///   admission (see `ShareGate`), so this limiter never scans or skips capped
+///   waiters.
+///
+/// With shares disabled every waiter is in the single WRR list, as before.
 pub struct InvokerConcurrencyLimiter {
     limiter: Concurrency,
     // Weighted round-robin over service groups instead of a flat FIFO, so no
     // service can monopolize freed permits regardless of arrival order.
     waiters: GroupedWaiters,
+    /// In-flight chain work (shares enabled only), served before `waiters`.
+    priority: GroupedWaiters,
     cached_permit: Permit,
     /// Queues `poll_head` woke for a cached permit that have not claimed one
     /// yet. A queue that loses the wake-then-steal race re-parks at the front
     /// of its own lane with its stride refunded. Cleared on successful claim
     /// and on external removal, so a stale flag can never grant a perpetual
     /// front position.
-    woken: SecondaryMap<VQueueHandle, ()>,
+    /// The value says whether the woken queue is in-flight chain work.
+    woken: SecondaryMap<VQueueHandle, bool>,
+    /// Node-wide weighted slot shares (no-op when disabled).
+    shares: SlotShares,
+    weight_resolver: WeightResolver,
+    lane_weight_resolver: LaneWeightResolver,
+    /// Parked queues and the share lane each one is counted as waiting in.
+    parked: SecondaryMap<VQueueHandle, Parked>,
+}
+
+#[derive(Clone)]
+struct Parked {
+    key: String,
+    /// In-flight chain work (a child or a resume): never counts as its lane
+    /// waiting for a share, and is served from the priority list.
+    exempt: bool,
+    weight: u32,
+}
+
+/// Share lane of a (group, service): node-wide key plus its weight.
+pub(super) fn lane_of(
+    group: &SchedulingGroup,
+    service: &ServiceName,
+    weight_resolver: &WeightResolver,
+    lane_weight_resolver: &LaneWeightResolver,
+) -> (String, u32) {
+    let key = match group {
+        SchedulingGroup::Scope(scope) => format!("{scope}/{service}"),
+        SchedulingGroup::Service(_) => format!("/{service}"),
+    };
+    let weight = weight_resolver(group)
+        .get()
+        .saturating_mul(lane_weight_resolver(group, service).get());
+    (key, weight)
 }
 
 impl InvokerConcurrencyLimiter {
@@ -38,18 +86,60 @@ impl InvokerConcurrencyLimiter {
         limiter: Concurrency,
         weight_resolver: WeightResolver,
         lane_weight_resolver: LaneWeightResolver,
+        shares: SlotShares,
     ) -> Self {
         Self {
             limiter,
-            waiters: GroupedWaiters::new(weight_resolver, lane_weight_resolver),
+            waiters: GroupedWaiters::new(weight_resolver.clone(), lane_weight_resolver.clone()),
+            priority: GroupedWaiters::new(weight_resolver.clone(), lane_weight_resolver.clone()),
             cached_permit: Permit::new_empty(),
             woken: SecondaryMap::new(),
+            shares,
+            weight_resolver,
+            lane_weight_resolver,
+            parked: SecondaryMap::new(),
         }
+    }
+
+    pub(super) fn lane_of(&self, group: &SchedulingGroup, service: &ServiceName) -> (String, u32) {
+        lane_of(group, service, &self.weight_resolver, &self.lane_weight_resolver)
     }
 
     pub fn remove_from_waiters(&mut self, vqueue: VQueueHandle) {
         self.woken.remove(vqueue);
         self.waiters.remove(vqueue);
+        self.priority.remove(vqueue);
+        self.unpark(vqueue);
+    }
+
+    fn park(&mut self, vqueue: VQueueHandle, parked: Parked) {
+        if self.parked.get(vqueue).is_some_and(|p| p.exempt == parked.exempt) {
+            return;
+        }
+        // the head entry changed between new start and in-flight: re-register
+        self.unpark(vqueue);
+        if !parked.exempt {
+            self.shares.set_waiting(&parked.key, parked.weight, 1);
+        }
+        self.parked.insert(vqueue, parked);
+    }
+
+    fn unpark(&mut self, vqueue: VQueueHandle) {
+        if let Some(p) = self.parked.remove(vqueue)
+            && !p.exempt
+        {
+            self.shares.set_waiting(&p.key, p.weight, -1);
+        }
+    }
+
+    fn claimed(&mut self, cx: &mut std::task::Context<'_>, vqueue: VQueueHandle) {
+        self.woken.remove(vqueue);
+        self.waiters.remove(vqueue);
+        self.priority.remove(vqueue);
+        self.unpark(vqueue);
+        if !self.waiters.is_empty() || !self.priority.is_empty() {
+            cx.waker().wake_by_ref();
+        }
     }
 
     /// Attempts to claim a permit for a queue the scheduler decided to dispatch.
@@ -58,50 +148,83 @@ impl InvokerConcurrencyLimiter {
     /// with a rotating WRR waiter head, a head-only gate livelocks (the woken
     /// queue arrives after the head has rotated past it). The waiter list's
     /// job is reduced to picking the wake-up order (see `poll_head`).
+    ///
+    /// `new_start`: a root's first run. With shares enabled a new start never
+    /// takes a slot while in-flight chain work is waiting for one.
     pub(super) fn poll_acquire(
         &mut self,
         cx: &mut std::task::Context<'_>,
         vqueue: VQueueHandle,
         group: &SchedulingGroup,
         service: &ServiceName,
-    ) -> Option<Permit> {
-        // cached permit exists (set aside by poll_head when it woke a waiter)
-        if let Some(permit) = self.cached_permit.split(1) {
-            self.claimed(cx, vqueue);
-            return Some(permit);
+        new_start: bool,
+    ) -> Option<(Permit, SlotLease)> {
+        let prioritised = self.shares.is_enabled();
+        let exempt = prioritised && !new_start;
+        // a new start yields while in-flight work waits for a slot or holds
+        // the turn for a permit set aside for it
+        let yields = prioritised
+            && new_start
+            && (!self.priority.is_empty() || self.woken.values().any(|in_flight| *in_flight));
+        if !yields {
+            // cached permit exists (set aside by poll_head when it woke a waiter)
+            let permit = match self.cached_permit.split(1) {
+                Some(permit) => Some(permit),
+                None => match self.limiter.poll_acquire(cx) {
+                    Poll::Ready(permit) => Some(permit),
+                    Poll::Pending => None,
+                },
+            };
+            if let Some(permit) = permit {
+                self.claimed(cx, vqueue);
+                let lease = if prioritised {
+                    let lane = self.lane_of(group, service);
+                    self.shares.take(&lane.0, lane.1)
+                } else {
+                    SlotLease::empty()
+                };
+                return Some((permit, lease));
+            }
         }
 
-        if let Poll::Ready(invoker_permit) = self.limiter.poll_acquire(cx) {
-            self.claimed(cx, vqueue);
-            return Some(invoker_permit);
-        }
-
-        // No permit available: park this queue in its service lane. A queue
-        // that lost the wake-then-steal race keeps its turn at the front.
-        if self.woken.remove(vqueue).is_some() {
-            self.waiters.push_front(vqueue, group, service);
+        // No permit available (or in-flight work goes first): park this queue.
+        // A queue that lost the wake-then-steal race keeps its turn.
+        // a queue whose head switched class leaves the other list
+        let list = if exempt {
+            self.waiters.remove(vqueue);
+            &mut self.priority
         } else {
-            self.waiters.push_back(vqueue, group, service);
+            self.priority.remove(vqueue);
+            &mut self.waiters
+        };
+        if self.woken.remove(vqueue).is_some() {
+            list.push_front(vqueue, group, service);
+        } else {
+            list.push_back(vqueue, group, service);
+        }
+        if prioritised {
+            let lane = self.lane_of(group, service);
+            self.park(
+                vqueue,
+                Parked {
+                    key: lane.0,
+                    exempt,
+                    weight: lane.1,
+                },
+            );
         }
         None
     }
 
-    fn claimed(&mut self, cx: &mut std::task::Context<'_>, vqueue: VQueueHandle) {
-        self.woken.remove(vqueue);
-        self.waiters.remove(vqueue);
-        if !self.waiters.is_empty() {
-            cx.waker().wake_by_ref();
-        }
-    }
-
     pub fn poll_head(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Option<VQueueHandle>> {
-        if self.waiters.is_empty() {
+        if self.waiters.is_empty() && self.priority.is_empty() {
             return Poll::Ready(None);
         }
 
         tracing::trace!(
-            "Polling invoker concurrency permits: {} waiters. Cached permit: {:?}",
+            "Polling invoker concurrency permits: {} + {} priority waiters. Cached permit: {:?}",
             self.waiters.len(),
+            self.priority.len(),
             self.cached_permit
         );
 
@@ -114,13 +237,17 @@ impl InvokerConcurrencyLimiter {
         }
 
         if !self.cached_permit.is_empty() {
-            // store this permit for the next poller.
-            let vqueue = self.waiters.pop_front().unwrap();
+            // store this permit for the next poller: in-flight chain work
+            // first, then new starts in WRR order
+            let (vqueue, in_flight) = match self.priority.pop_front() {
+                Some(v) => (v, true),
+                None => (self.waiters.pop_front().unwrap(), false),
+            };
             // remember the chosen waiter: if it loses the claim race it keeps
             // its turn (front of its lane, stride refunded) instead of
             // re-parking at the back
-            self.woken.insert(vqueue, ());
-            if !self.waiters.is_empty() {
+            self.woken.insert(vqueue, in_flight);
+            if !self.waiters.is_empty() || !self.priority.is_empty() {
                 // make sure to take the waker again for the next poll
                 cx.waker().wake_by_ref();
             }
@@ -128,6 +255,18 @@ impl InvokerConcurrencyLimiter {
         }
 
         Poll::Pending
+    }
+}
+
+impl Drop for InvokerConcurrencyLimiter {
+    /// The shares are node-wide and outlive this partition's leadership: give
+    /// back every waiting registration of a parked new start.
+    fn drop(&mut self) {
+        for (_, p) in self.parked.drain() {
+            if !p.exempt {
+                self.shares.set_waiting(&p.key, p.weight, -1);
+            }
+        }
     }
 }
 
@@ -164,6 +303,7 @@ mod tests {
             Concurrency::new(Some(NonZeroUsize::new(1).unwrap())),
             resolver(),
             lane_resolver(),
+            SlotShares::disabled(),
         )
     }
 
@@ -190,21 +330,21 @@ mod tests {
 
         // holder takes the only permit; A, A2 (same lane) and B park
         let permit = limiter
-            .poll_acquire(&mut cx, holder, &group("holder"), &svc("holder"))
+            .poll_acquire(&mut cx, holder, &group("holder"), &svc("holder"), true)
             .expect("permit");
         assert!(
             limiter
-                .poll_acquire(&mut cx, vq_a, &group_a, &svc_a)
+                .poll_acquire(&mut cx, vq_a, &group_a, &svc_a, true)
                 .is_none()
         );
         assert!(
             limiter
-                .poll_acquire(&mut cx, vq_a2, &group_a, &svc_a)
+                .poll_acquire(&mut cx, vq_a2, &group_a, &svc_a, true)
                 .is_none()
         );
         assert!(
             limiter
-                .poll_acquire(&mut cx, vq_b, &group_b, &svc_b)
+                .poll_acquire(&mut cx, vq_b, &group_b, &svc_b, true)
                 .is_none()
         );
 
@@ -215,13 +355,13 @@ mod tests {
 
         // B "wins the race" to dispatch first and steals the cached permit
         let stolen = limiter
-            .poll_acquire(&mut cx, vq_b, &group_b, &svc_b)
+            .poll_acquire(&mut cx, vq_b, &group_b, &svc_b, true)
             .expect("B claims the cached permit");
 
         // A loses and re-parks — at the FRONT of its lane, ahead of A2
         assert!(
             limiter
-                .poll_acquire(&mut cx, vq_a, &group_a, &svc_a)
+                .poll_acquire(&mut cx, vq_a, &group_a, &svc_a, true)
                 .is_none()
         );
         assert_eq!(
@@ -236,7 +376,7 @@ mod tests {
         assert!(matches!(woken, Poll::Ready(Some(h)) if h == vq_a));
         assert!(
             limiter
-                .poll_acquire(&mut cx, vq_a, &group_a, &svc_a)
+                .poll_acquire(&mut cx, vq_a, &group_a, &svc_a, true)
                 .is_some(),
             "A claims the permit on its wake"
         );
@@ -258,11 +398,11 @@ mod tests {
         let mut limiter = limiter_with_one_permit();
 
         let permit = limiter
-            .poll_acquire(&mut cx, holder, &group("holder"), &svc("holder"))
+            .poll_acquire(&mut cx, holder, &group("holder"), &svc("holder"), true)
             .expect("permit");
         assert!(
             limiter
-                .poll_acquire(&mut cx, vq_a, &group_a, &svc_a)
+                .poll_acquire(&mut cx, vq_a, &group_a, &svc_a, true)
                 .is_none()
         );
         drop(permit);
@@ -273,19 +413,19 @@ mod tests {
         limiter.remove_from_waiters(vq_a);
         // consume the cached permit so the re-parks below actually park
         let p = limiter
-            .poll_acquire(&mut cx, holder, &group("holder"), &svc("holder"))
+            .poll_acquire(&mut cx, holder, &group("holder"), &svc("holder"), true)
             .expect("cached permit");
 
         // A2 parks first, then A re-parks: A must land BEHIND A2 (plain
         // push_back — no front privilege from the stale flag)
         assert!(
             limiter
-                .poll_acquire(&mut cx, vq_a2, &group_a, &svc_a)
+                .poll_acquire(&mut cx, vq_a2, &group_a, &svc_a, true)
                 .is_none()
         );
         assert!(
             limiter
-                .poll_acquire(&mut cx, vq_a, &group_a, &svc_a)
+                .poll_acquire(&mut cx, vq_a, &group_a, &svc_a, true)
                 .is_none()
         );
         assert_eq!(
@@ -294,5 +434,47 @@ mod tests {
             "stale woken flag must not jump the queue"
         );
         drop(p);
+    }
+
+    /// With shares enabled, in-flight chain work (a child or a resume) is
+    /// served before new chain starts: a freed slot wakes the waiting child
+    /// even though the new start parked first, and the new start may not
+    /// steal the set-aside permit while the child waits.
+    #[test]
+    fn in_flight_work_is_served_before_new_starts() {
+        let mut handles = SlotMap::<VQueueHandle, ()>::with_key();
+        let holder = handles.insert(());
+        let root = handles.insert(());
+        let child = handles.insert(());
+        let (g_rail, s_root, s_child) = (group("rail"), svc("root"), svc("child"));
+
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let one = NonZeroUsize::new(1).unwrap();
+        let mut limiter = InvokerConcurrencyLimiter::new(
+            Concurrency::new(Some(one)),
+            resolver(),
+            lane_resolver(),
+            SlotShares::new(Some(one), true),
+        );
+
+        let held = limiter
+            .poll_acquire(&mut cx, holder, &g_rail, &s_root, false)
+            .expect("slot");
+        // a new start parks first, then a child of a running chain
+        assert!(limiter.poll_acquire(&mut cx, root, &g_rail, &s_root, true).is_none());
+        assert!(limiter.poll_acquire(&mut cx, child, &g_rail, &s_child, false).is_none());
+
+        drop(held);
+        let woken = limiter.poll_head(&mut cx);
+        assert!(
+            matches!(woken, Poll::Ready(Some(h)) if h == child),
+            "the freed slot goes to in-flight work first"
+        );
+        assert!(
+            limiter.poll_acquire(&mut cx, root, &g_rail, &s_root, true).is_none(),
+            "a new start must not steal the permit set aside for in-flight work"
+        );
+        assert!(limiter.poll_acquire(&mut cx, child, &g_rail, &s_child, false).is_some());
     }
 }

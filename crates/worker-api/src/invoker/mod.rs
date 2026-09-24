@@ -12,6 +12,7 @@ pub mod capacity;
 mod effects;
 pub mod entry_enricher;
 mod handle;
+pub mod slot_shares;
 pub mod invocation_reader;
 pub mod status_handle;
 
