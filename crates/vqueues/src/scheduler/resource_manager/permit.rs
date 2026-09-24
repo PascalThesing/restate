@@ -37,6 +37,16 @@ impl PermitBuilder {
         self.user_permit
     }
 
+    /// The chain permit staged for this entry, if any.
+    pub fn chain_entry(&self) -> Option<EntryId> {
+        self.user_permit.as_ref().and_then(|p| p.chain_entry)
+    }
+
+    /// Forgets the staged chain permit (the caller released it).
+    pub fn take_chain_entry(&mut self) -> Option<EntryId> {
+        self.user_permit.as_mut().and_then(|p| p.chain_entry.take())
+    }
+
     pub fn has_invoker_permit(&self) -> bool {
         !self.system_permit.invoker_permit.is_empty()
     }

@@ -200,6 +200,8 @@ pub struct EntryMetadataRef<'a> {
     pub retry_count_since_last_stored_command: u32,
     #[bilrost(tag(5))]
     chain_root: Option<&'a str>,
+    #[bilrost(tag(6))]
+    has_parent: bool,
 }
 
 impl<'a> From<&'a EntryMetadata> for EntryMetadataRef<'a> {
@@ -211,6 +213,7 @@ impl<'a> From<&'a EntryMetadata> for EntryMetadataRef<'a> {
             retry_attempts: value.retry_attempts,
             retry_count_since_last_stored_command: value.retry_count_since_last_stored_command,
             chain_root: value.chain_root.as_deref(),
+            has_parent: value.has_parent,
         }
     }
 }
@@ -232,6 +235,13 @@ pub struct EntryMetadata {
     /// backlog it inherits. `None` for children and pre-c8 entries.
     #[bilrost(tag(5))]
     pub chain_root: Option<ReString>,
+    /// True when another invocation called this one (`Source::Service`). A
+    /// first run without a parent is a *new start* for the invoker's slot
+    /// shares and in-flight priority; children and resumes are in-flight
+    /// work. `false` for pre-existing entries: they are treated as new
+    /// starts, the conservative choice.
+    #[bilrost(tag(6))]
+    pub has_parent: bool,
 }
 
 #[cfg(test)]

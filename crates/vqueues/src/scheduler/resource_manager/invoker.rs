@@ -14,7 +14,7 @@ use slotmap::SecondaryMap;
 
 use restate_futures_util::concurrency::{Concurrency, Permit};
 use restate_types::ServiceName;
-use restate_worker_api::invoker::slot_shares::{SlotLease, SlotShares};
+use restate_worker_api::invoker::slot_shares::{GroupKey, OwnedShareLane, ShareLane, SlotLease, SlotShares};
 
 use super::grouped_waiters::GroupedWaiters;
 use crate::scheduler::VQueueHandle;
@@ -26,10 +26,12 @@ use crate::scheduler::eligible::{LaneWeightResolver, SchedulingGroup, WeightReso
 /// - **in-flight** work of chains that already run (children, resumes): served
 ///   first, so a chain holding slots while it awaits its children always gets
 ///   them run (no hold-and-wait on the pool);
-/// - **new chain starts** (a root's first run): served only when no in-flight
-///   work waits. Their weighted share is enforced *before* they get here, at
-///   admission (see `ShareGate`), so this limiter never scans or skips capped
-///   waiters.
+/// - **new starts** (a first run with no parent): served only when no in-flight
+///   work waits, except that after `priority_burst` consecutive in-flight
+///   grants one freed slot goes to a new start, so a steady stream of in-flight
+///   work can never starve new starts. Their weighted share is enforced
+///   *before* they get here, at admission (see `ShareGate`), and again at
+///   claim time by the resource manager.
 ///
 /// With shares disabled every waiter is in the single WRR list, as before.
 pub struct InvokerConcurrencyLimiter {
@@ -53,32 +55,39 @@ pub struct InvokerConcurrencyLimiter {
     lane_weight_resolver: LaneWeightResolver,
     /// Parked queues and the share lane each one is counted as waiting in.
     parked: SecondaryMap<VQueueHandle, Parked>,
+    /// After this many consecutive in-flight grants while new starts wait, one
+    /// freed slot goes to a new start.
+    priority_burst: u32,
+    /// Consecutive in-flight grants since the last new-start grant.
+    priority_grants: u32,
 }
 
 #[derive(Clone)]
 struct Parked {
-    key: String,
+    lane: OwnedShareLane,
     /// In-flight chain work (a child or a resume): never counts as its lane
     /// waiting for a share, and is served from the priority list.
     exempt: bool,
-    weight: u32,
 }
 
-/// Share lane of a (group, service): node-wide key plus its weight.
-pub(super) fn lane_of(
-    group: &SchedulingGroup,
-    service: &ServiceName,
+/// Share lane of a (group, service): the group (scope, or the service itself
+/// when unscoped) with its weight, and the service lane with its lane weight.
+pub(super) fn lane_of<'a>(
+    group: &'a SchedulingGroup,
+    service: &'a ServiceName,
     weight_resolver: &WeightResolver,
     lane_weight_resolver: &LaneWeightResolver,
-) -> (String, u32) {
+) -> ShareLane<'a> {
     let key = match group {
-        SchedulingGroup::Scope(scope) => format!("{scope}/{service}"),
-        SchedulingGroup::Service(_) => format!("/{service}"),
+        SchedulingGroup::Scope(scope) => GroupKey::Scope(scope.as_str()),
+        SchedulingGroup::Service(name) => GroupKey::Service(name.as_ref()),
     };
-    let weight = weight_resolver(group)
-        .get()
-        .saturating_mul(lane_weight_resolver(group, service).get());
-    (key, weight)
+    ShareLane {
+        group: key,
+        group_weight: weight_resolver(group).get(),
+        lane: service.as_ref(),
+        lane_weight: lane_weight_resolver(group, service).get(),
+    }
 }
 
 impl InvokerConcurrencyLimiter {
@@ -87,8 +96,11 @@ impl InvokerConcurrencyLimiter {
         weight_resolver: WeightResolver,
         lane_weight_resolver: LaneWeightResolver,
         shares: SlotShares,
+        priority_burst: u32,
     ) -> Self {
         Self {
+            priority_burst: priority_burst.max(1),
+            priority_grants: 0,
             limiter,
             waiters: GroupedWaiters::new(weight_resolver.clone(), lane_weight_resolver.clone()),
             priority: GroupedWaiters::new(weight_resolver.clone(), lane_weight_resolver.clone()),
@@ -101,7 +113,11 @@ impl InvokerConcurrencyLimiter {
         }
     }
 
-    pub(super) fn lane_of(&self, group: &SchedulingGroup, service: &ServiceName) -> (String, u32) {
+    pub(super) fn lane_of<'a>(
+        &self,
+        group: &'a SchedulingGroup,
+        service: &'a ServiceName,
+    ) -> ShareLane<'a> {
         lane_of(group, service, &self.weight_resolver, &self.lane_weight_resolver)
     }
 
@@ -119,7 +135,7 @@ impl InvokerConcurrencyLimiter {
         // the head entry changed between new start and in-flight: re-register
         self.unpark(vqueue);
         if !parked.exempt {
-            self.shares.set_waiting(&parked.key, parked.weight, 1);
+            self.shares.set_waiting(parked.lane.as_lane(), 1);
         }
         self.parked.insert(vqueue, parked);
     }
@@ -128,7 +144,7 @@ impl InvokerConcurrencyLimiter {
         if let Some(p) = self.parked.remove(vqueue)
             && !p.exempt
         {
-            self.shares.set_waiting(&p.key, p.weight, -1);
+            self.shares.set_waiting(p.lane.as_lane(), -1);
         }
     }
 
@@ -162,9 +178,12 @@ impl InvokerConcurrencyLimiter {
         let prioritised = self.shares.is_enabled();
         let exempt = prioritised && !new_start;
         // a new start yields while in-flight work waits for a slot or holds
-        // the turn for a permit set aside for it
+        // the turn for a permit set aside for it — unless poll_head chose this
+        // very start (burst guard), in which case the permit is its own
+        let chosen = self.woken.get(vqueue) == Some(&false);
         let yields = prioritised
             && new_start
+            && !chosen
             && (!self.priority.is_empty() || self.woken.values().any(|in_flight| *in_flight));
         if !yields {
             // cached permit exists (set aside by poll_head when it woke a waiter)
@@ -178,8 +197,7 @@ impl InvokerConcurrencyLimiter {
             if let Some(permit) = permit {
                 self.claimed(cx, vqueue);
                 let lease = if prioritised {
-                    let lane = self.lane_of(group, service);
-                    self.shares.take(&lane.0, lane.1)
+                    self.shares.take(self.lane_of(group, service))
                 } else {
                     SlotLease::empty()
                 };
@@ -203,15 +221,8 @@ impl InvokerConcurrencyLimiter {
             list.push_back(vqueue, group, service);
         }
         if prioritised {
-            let lane = self.lane_of(group, service);
-            self.park(
-                vqueue,
-                Parked {
-                    key: lane.0,
-                    exempt,
-                    weight: lane.1,
-                },
-            );
+            let lane = OwnedShareLane::from_lane(self.lane_of(group, service));
+            self.park(vqueue, Parked { lane, exempt });
         }
         None
     }
@@ -239,10 +250,25 @@ impl InvokerConcurrencyLimiter {
         if !self.cached_permit.is_empty() {
             // store this permit for the next poller: in-flight chain work
             // first, then new starts in WRR order
-            let (vqueue, in_flight) = match self.priority.pop_front() {
-                Some(v) => (v, true),
-                None => (self.waiters.pop_front().unwrap(), false),
+            // burst guard: after `priority_burst` in-flight grants in a row
+            // while new starts wait, the next freed slot is theirs
+            let starve_guard =
+                !self.waiters.is_empty() && self.priority_grants >= self.priority_burst;
+            let (vqueue, in_flight) = if !starve_guard
+                && let Some(v) = self.priority.pop_front()
+            {
+                (v, true)
+            } else {
+                match self.waiters.pop_front() {
+                    Some(v) => (v, false),
+                    None => (self.priority.pop_front().expect("some waiter"), true),
+                }
             };
+            if in_flight {
+                self.priority_grants += 1;
+            } else {
+                self.priority_grants = 0;
+            }
             // remember the chosen waiter: if it loses the claim race it keeps
             // its turn (front of its lane, stride refunded) instead of
             // re-parking at the back
@@ -264,7 +290,7 @@ impl Drop for InvokerConcurrencyLimiter {
     fn drop(&mut self) {
         for (_, p) in self.parked.drain() {
             if !p.exempt {
-                self.shares.set_waiting(&p.key, p.weight, -1);
+                self.shares.set_waiting(p.lane.as_lane(), -1);
             }
         }
     }
@@ -304,6 +330,7 @@ mod tests {
             resolver(),
             lane_resolver(),
             SlotShares::disabled(),
+            8,
         )
     }
 
@@ -456,6 +483,7 @@ mod tests {
             resolver(),
             lane_resolver(),
             SlotShares::new(Some(one), true),
+            8,
         );
 
         let held = limiter
@@ -476,5 +504,60 @@ mod tests {
             "a new start must not steal the permit set aside for in-flight work"
         );
         assert!(limiter.poll_acquire(&mut cx, child, &g_rail, &s_child, false).is_some());
+    }
+
+    /// Burst guard: with in-flight work always waiting, a parked new start
+    /// still gets a slot after `priority_burst` in-flight grants, so a steady
+    /// stream of children cannot starve new starts.
+    #[test]
+    fn new_start_gets_a_slot_after_the_priority_burst() {
+        let mut handles = SlotMap::<VQueueHandle, ()>::with_key();
+        let holder = handles.insert(());
+        let start = handles.insert(());
+        let (g, s_root, s_child) = (group("rail"), svc("root"), svc("child"));
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let one = NonZeroUsize::new(1).unwrap();
+        let burst: u32 = 2;
+        let mut limiter = InvokerConcurrencyLimiter::new(
+            Concurrency::new(Some(one)),
+            resolver(),
+            lane_resolver(),
+            SlotShares::new(Some(one), true),
+            burst,
+        );
+        let mut held = limiter
+            .poll_acquire(&mut cx, holder, &g, &s_root, false)
+            .expect("slot");
+        assert!(limiter.poll_acquire(&mut cx, start, &g, &s_root, true).is_none());
+
+        let mut granted_to_start = None;
+        for round in 0..(burst as usize + 1) {
+            // a fresh child is always waiting when the slot frees
+            let child = handles.insert(());
+            assert!(limiter.poll_acquire(&mut cx, child, &g, &s_child, false).is_none());
+            drop(held);
+            let woken = match limiter.poll_head(&mut cx) {
+                Poll::Ready(Some(h)) => h,
+                other => panic!("expected a wake, got {other:?}"),
+            };
+            if woken == start {
+                granted_to_start = Some(round);
+                assert!(
+                    limiter.poll_acquire(&mut cx, start, &g, &s_root, true).is_some(),
+                    "the chosen new start may claim its permit despite waiting children"
+                );
+                break;
+            }
+            assert_eq!(woken, child, "in-flight work first");
+            held = limiter
+                .poll_acquire(&mut cx, child, &g, &s_child, false)
+                .expect("child claims");
+        }
+        assert_eq!(
+            granted_to_start,
+            Some(burst as usize),
+            "after {burst} in-flight grants the next freed slot is the new start's"
+        );
     }
 }

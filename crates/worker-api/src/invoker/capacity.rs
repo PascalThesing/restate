@@ -12,8 +12,11 @@ use std::num::NonZeroUsize;
 
 use restate_futures_util::concurrency::Concurrency;
 use restate_memory::{MemoryPool, NonZeroByteCount};
-use restate_types::config::{DEFAULT_PER_INVOCATION_INITIAL_MEMORY, ThrottlingOptions};
+use restate_types::config::{
+    ChainAdmissionOptions, DEFAULT_PER_INVOCATION_INITIAL_MEMORY, ThrottlingOptions,
+};
 
+use super::chain_node::{ChainAdmissionConfig, ChainNode};
 use super::slot_shares::SlotShares;
 
 pub type TokenBucket<C = gardal::TokioClock> = gardal::SharedTokenBucket<C>;
@@ -28,6 +31,11 @@ pub struct InvokerCapacity {
     pub initial_invocation_memory: NonZeroByteCount,
     /// Weighted shares of `concurrency`, node-wide (disabled unless configured).
     pub slot_shares: SlotShares,
+    /// With shares on: consecutive in-flight grants before one freed slot goes
+    /// to a waiting new start.
+    pub in_flight_priority_burst: u32,
+    /// Node-wide chain admission (disabled unless configured).
+    pub chain_node: ChainNode,
 }
 
 impl InvokerCapacity {
@@ -39,6 +47,8 @@ impl InvokerCapacity {
             memory_pool: MemoryPool::unlimited(),
             initial_invocation_memory: DEFAULT_PER_INVOCATION_INITIAL_MEMORY,
             slot_shares: SlotShares::disabled(),
+            in_flight_priority_burst: 8,
+            chain_node: ChainNode::disabled(),
         }
     }
 
@@ -49,9 +59,16 @@ impl InvokerCapacity {
         memory_pool: MemoryPool,
         initial_invocation_memory: NonZeroByteCount,
         weighted_slot_shares: bool,
+        in_flight_priority_burst: u32,
+        chain_admission: &ChainAdmissionOptions,
     ) -> Self {
         Self {
             slot_shares: SlotShares::new(concurrency, weighted_slot_shares),
+            in_flight_priority_burst,
+            chain_node: ChainNode::new(ChainAdmissionConfig::from_options(
+                chain_admission,
+                concurrency.map(|c| c.get()),
+            )),
             concurrency: Concurrency::new(concurrency),
             invocation_token_bucket: invocation_throttling.map(|opts| {
                 TokenBucket::new(gardal::Limit::from(opts.clone()), gardal::TokioClock)

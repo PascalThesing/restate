@@ -94,6 +94,9 @@ async fn start_root(test_env: &mut TestEnv, target: InvocationTarget) -> Invocat
 /// won't let escape this function.
 struct VqueueSnapshot {
     chain_root: Option<ReString>,
+    /// Another invocation called this one: in-flight work for the invoker,
+    /// never a new start.
+    has_parent: bool,
     vqueue_id: VQueueId,
     entry_key: EntryKey,
 }
@@ -112,6 +115,7 @@ async fn vqueue_snapshot(test_env: &mut TestEnv, invocation_id: InvocationId) ->
         .expect("vqueue entry must exist for this invocation");
     VqueueSnapshot {
         chain_root: header.metadata().chain_root.clone(),
+        has_parent: header.metadata().has_parent,
         vqueue_id: header.vqueue_id().clone(),
         entry_key: *header.entry_key(),
     }
@@ -204,6 +208,10 @@ async fn root_gets_chain_root_marker_and_dedicated_vqueue_child_does_not() {
         Some(ReString::from(root_target.service_name().to_string())),
         "an ingress-invoked non-exclusive root must be marked with its service name"
     );
+    assert!(
+        !root_snapshot.has_parent,
+        "nothing called the root: it is a new start for the invoker"
+    );
 
     let root_qid = VQueue::infer_root_vqueue_id_from_invocation(
         partition_key,
@@ -255,9 +263,11 @@ async fn root_gets_chain_root_marker_and_dedicated_vqueue_child_does_not() {
         .apply(commands::InvokeCommand::test_envelope(child))
         .await;
 
-    // A call child (Source::Service) is never a chain root.
+    // A call child (Source::Service) is never a chain root, but it has a
+    // parent: in-flight work of a running chain.
     let child_snapshot = vqueue_snapshot(&mut test_env, child_id).await;
     assert_that!(child_snapshot.chain_root, none());
+    assert!(child_snapshot.has_parent, "a call child carries the parent marker");
     assert_eq!(
         child_snapshot.vqueue_id,
         VQueue::infer_vqueue_id_from_invocation(

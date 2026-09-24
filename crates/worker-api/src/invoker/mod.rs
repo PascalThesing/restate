@@ -9,6 +9,10 @@
 // by the Apache License, Version 2.0.
 
 pub mod capacity;
+pub mod chain_metrics;
+pub mod chain_node;
+pub mod gradient2;
+pub(crate) mod notify;
 mod effects;
 pub mod entry_enricher;
 mod handle;
@@ -19,6 +23,7 @@ pub mod status_handle;
 pub use effects::*;
 pub use entry_enricher::EntryEnricher;
 pub use handle::*;
+pub use notify::ChangeSubscription;
 pub use invocation_reader::{InvocationReaderError, JournalKind, JournalMetadata};
 pub use restate_storage_api::vqueue_table::scheduler::YieldReason;
 pub use status_handle::{InvocationErrorReport, InvocationStatusReport, StatusHandle};

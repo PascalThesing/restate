@@ -29,7 +29,6 @@ pub(super) fn test_grouped_waiters(
     )
 }
 mod chain_admission;
-mod gradient2;
 mod invoker_memory;
 mod invoker_throttle;
 mod locks;
@@ -37,9 +36,9 @@ mod permit;
 mod share_gate;
 mod user_limiter;
 
-pub use self::chain_admission::ChainAdmissionConfig;
-pub use self::gradient2::ControllerParams;
 pub use self::permit::PermitBuilder;
+pub use restate_worker_api::invoker::chain_node::{ChainAdmissionConfig, ChainNode};
+pub use restate_worker_api::invoker::gradient2::ControllerParams;
 
 use std::collections::VecDeque;
 use std::task::Poll;
@@ -64,6 +63,7 @@ use restate_worker_api::resources::{ChainSignal, ResourceManagerUpdate, UserPerm
 use restate_worker_api::{ResourceKind, UserLimitCounterEntry};
 
 use self::chain_admission::{Admit, ChainAdmission};
+use restate_worker_api::invoker::chain_node::ChainKey;
 use self::invoker::InvokerConcurrencyLimiter;
 use self::invoker_memory::InvokerMemoryLimiter;
 use self::invoker_throttle::{InvokerThrottlingLimiter, ThrottlingAcquire};
@@ -87,8 +87,11 @@ pub struct ResourceManager {
     invoker_memory: InvokerMemoryLimiter,
     user_limiter: UserLimiter,
     chain: ChainAdmission,
-    /// Weighted slot shares for new chain starts, enforced before the invoker.
+    /// Weighted slot shares for new starts, enforced before the invoker.
     share_gate: ShareGate,
+    /// Queues to wake on the next `poll_resources` (a chain permit given back
+    /// at claim time, where the eligibility tracker is not at hand).
+    deferred_wake: Vec<VQueueHandle>,
     rx: mpsc::UnboundedReceiver<ResourceManagerUpdate>,
     // We need to keep this alive to:
     // - Keep the receiver alive even if we don't have any resource permits handed out
@@ -110,8 +113,9 @@ impl ResourceManager {
         weight_resolver: WeightResolver,
         lane_weight_resolver: LaneWeightResolver,
         partition_label: String,
-        chain_config: ChainAdmissionConfig,
+        chain_node: ChainNode,
         slot_shares: SlotShares,
+        in_flight_priority_burst: u32,
     ) -> Result<Self, StorageError> {
         let locks = Locks::create(storage).await?;
 
@@ -123,12 +127,14 @@ impl ResourceManager {
                 weight_resolver,
                 lane_weight_resolver,
                 slot_shares.clone(),
+                in_flight_priority_burst,
             ),
             share_gate: ShareGate::new(slot_shares),
             invoker_throttling: InvokerThrottlingLimiter::new(global_throttling),
             invoker_memory: InvokerMemoryLimiter::new(memory_pool, initial_invocation_memory),
             user_limiter: UserLimiter::create(),
-            chain: ChainAdmission::new(chain_config, partition_label),
+            chain: ChainAdmission::new(chain_node, partition_label),
+            deferred_wake: Vec::new(),
             locks,
             rx,
             tx: _tx,
@@ -175,8 +181,14 @@ impl ResourceManager {
                 self.user_limiter
                     .remove_from_waiters(handle, scope, limit_key, *blocked_level);
             }
-            ResourceKind::ChainAdmission { root } => {
-                self.chain.remove_waiter(handle, root);
+            ResourceKind::ChainAdmission { scope, root } => {
+                self.chain.remove_waiter(
+                    handle,
+                    &ChainKey {
+                        scope: scope.clone(),
+                        root: root.clone(),
+                    },
+                );
             }
             ResourceKind::SlotShare { .. } => {
                 self.share_gate.remove(handle);
@@ -231,7 +243,8 @@ impl ResourceManager {
 
         if let Some(entry_id) = permit.chain_entry {
             let mut woken = Vec::new();
-            self.chain.release_unstarted(entry_id, &mut woken);
+            self.chain
+                .release_unstarted(entry_id, tokio::time::Instant::now(), &mut woken);
             eligible.wake_up_queues(woken);
         }
     }
@@ -307,23 +320,53 @@ impl ResourceManager {
                 ));
             }
 
-            // Chain admission (last user check, so a permit is only taken when
-            // everything else is available): a root invocation needs a chain permit before
-            // its first run (and again after an external wait or a pause).
-            // Children and resumes of a running chain are never gated here.
             if key.kind() == EntryKind::Invocation {
-                match self.chain.poll_admit(
-                    vqueue,
-                    *key.entry_id(),
-                    metadata.chain_root.as_deref(),
-                    first_run,
-                    tokio::time::Instant::now(),
-                ) {
+                let now = tokio::time::Instant::now();
+                let chain_key = self
+                    .chain
+                    .key_of(metadata.chain_root.as_deref(), meta.scope().as_ref());
+                // Weighted slot share, checked before chain admission so a
+                // start held back by its share never holds a chain permit.
+                // Only new starts (a first run nothing called) are subject
+                // to it; in-flight work (children, resumes) is never capped.
+                let new_start = first_run && !metadata.has_parent;
+                if new_start && self.share_gate.is_enabled() {
+                    let service = meta
+                        .service_name()
+                        .cloned()
+                        .unwrap_or_else(super::eligible::unlinked_group);
+                    let group = SchedulingGroup::of(meta);
+                    let lane = self.invoker_concurrency.lane_of(&group, &service);
+                    if !self.share_gate.admit(vqueue, lane) {
+                        // a stale chain-waiter registration must not eat the
+                        // wake budget of its key
+                        if let Some(k) = &chain_key {
+                            self.chain.remove_waiter(vqueue, k);
+                        }
+                        self.invoker_concurrency.remove_from_waiters(vqueue);
+                        return AcquireOutcome::BlockedOn(ResourceKind::SlotShare {
+                            lane: ReString::new(share_lane_label(&group, &service)),
+                        });
+                    }
+                }
+
+                // Chain admission (last user check, so a permit is only taken
+                // when everything else is available): a root invocation needs
+                // a chain permit before its first run (and again after an
+                // external wait or a pause). Children and resumes of a running
+                // chain are never gated here.
+                match self
+                    .chain
+                    .poll_admit(vqueue, *key.entry_id(), chain_key, first_run, now)
+                {
                     Admit::NotGated => {}
                     Admit::Admitted => provisional.set_chain_entry(*key.entry_id()),
-                    Admit::Blocked(root) => {
-                        trace!(root = %root, "Chain admission limit reached");
-                        return AcquireOutcome::BlockedOn(ResourceKind::ChainAdmission { root });
+                    Admit::Blocked(chain_key) => {
+                        trace!(chain = %chain_key, "Chain admission limit reached");
+                        return AcquireOutcome::BlockedOn(ResourceKind::ChainAdmission {
+                            scope: chain_key.scope,
+                            root: chain_key.root,
+                        });
                     }
                 }
             }
@@ -348,17 +391,30 @@ impl ResourceManager {
                         .cloned()
                         .unwrap_or_else(super::eligible::unlinked_group);
                     let group = SchedulingGroup::of(meta);
-                    // Weighted slot shares apply to new chain starts only;
-                    // in-flight chain work (children, resumes) is never
-                    // capped and is served first by the invoker.
-                    let new_start = first_run && metadata.chain_root.is_some();
+                    // Claim-time re-check of the weighted slot share: a new
+                    // start that passed the early check may have parked at a
+                    // full pool and gets its slot here by WRR, so the share
+                    // is enforced again. A refused start gives its chain
+                    // permit back, so it holds nothing while it waits.
+                    let new_start = first_run && !metadata.has_parent;
                     if self.share_gate.is_enabled() {
                         if new_start {
                             let lane = self.invoker_concurrency.lane_of(&group, &service);
-                            if !self.share_gate.admit(vqueue, lane.clone()) {
+                            if !self.share_gate.admit(vqueue, lane) {
                                 self.invoker_concurrency.remove_from_waiters(vqueue);
+                                if let Some(entry_id) = current_permit.take_chain_entry() {
+                                    let now = tokio::time::Instant::now();
+                                    self.chain.release_unstarted(
+                                        entry_id,
+                                        now,
+                                        &mut self.deferred_wake,
+                                    );
+                                    if !self.deferred_wake.is_empty() {
+                                        cx.waker().wake_by_ref();
+                                    }
+                                }
                                 return AcquireOutcome::BlockedOn(ResourceKind::SlotShare {
-                                    lane: ReString::new(lane.0),
+                                    lane: ReString::new(share_lane_label(&group, &service)),
                                 });
                             }
                         } else {
@@ -396,6 +452,10 @@ impl ResourceManager {
             }
         }
 
+        // the chain (if any) has its invoker slot now: it is running
+        if let Some(entry_id) = current_permit.chain_entry() {
+            self.chain.mark_started(entry_id, tokio::time::Instant::now());
+        }
         AcquireOutcome::Acquired(current_permit.take())
     }
 
@@ -444,6 +504,11 @@ impl ResourceManager {
         self.share_gate.poll_wake(cx, &mut share_woken);
         eligible.wake_up_queues(share_woken);
 
+        let mut chain_woken = std::mem::take(&mut self.deferred_wake);
+        self.chain
+            .poll_wake(cx, tokio::time::Instant::now(), &mut chain_woken);
+        eligible.wake_up_queues(chain_woken);
+
         while let Poll::Ready(Some(queue)) = self.invoker_throttling.poll_head(cx) {
             tracing::trace!(
                 "waking up vqueue {queue:?} because invoker throttling token became available"
@@ -469,5 +534,13 @@ impl ResourceManager {
         self.user_limiter
             .resolve_rule(handle)
             .map(|pattern| ReString::new(pattern.to_string()))
+    }
+}
+
+/// Display label of a share lane: `scope/service`, or `/service` unscoped.
+fn share_lane_label(group: &SchedulingGroup, service: &restate_types::ServiceName) -> String {
+    match group {
+        SchedulingGroup::Scope(scope) => format!("{scope}/{service}"),
+        SchedulingGroup::Service(_) => format!("/{service}"),
     }
 }

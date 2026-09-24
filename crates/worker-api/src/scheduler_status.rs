@@ -113,7 +113,10 @@ pub enum ResourceKind {
     },
     /// Waiting for a chain permit: the root service's automatic admission
     /// limit is fully used by chains in progress.
-    ChainAdmission { root: ServiceName },
+    ChainAdmission {
+        scope: Option<Scope>,
+        root: ServiceName,
+    },
     /// A new chain start waiting for its root lane's weighted slot share.
     SlotShare { lane: ReString },
 }
@@ -141,7 +144,8 @@ impl ResourceKind {
             }
             ResourceKind::InvokerMemory => BlockedResource::InvokerMemory,
             ResourceKind::DeploymentConcurrency => BlockedResource::DeploymentConcurrency,
-            ResourceKind::ChainAdmission { root } => BlockedResource::ChainAdmission {
+            ResourceKind::ChainAdmission { scope, root } => BlockedResource::ChainAdmission {
+                scope: scope.clone(),
                 root: ReString::new(root.to_string()),
             },
             ResourceKind::SlotShare { lane } => BlockedResource::SlotShare { lane: lane.clone() },
@@ -206,7 +210,10 @@ pub enum BlockedResource {
         blocked_rule: Option<ReString>,
     },
     /// Waiting for a chain permit of the given root service.
-    ChainAdmission { root: ReString },
+    ChainAdmission {
+        scope: Option<Scope>,
+        root: ReString,
+    },
     /// A new chain start waiting for its lane's weighted slot share.
     SlotShare { lane: ReString },
 }
@@ -225,7 +232,10 @@ impl std::fmt::Display for BlockedResource {
             },
             BlockedResource::InvokerMemory => f.write_str("InvokerMemory"),
             BlockedResource::DeploymentConcurrency => f.write_str("DeploymentConcurrency"),
-            BlockedResource::ChainAdmission { root } => write!(f, "ChainAdmission(root={root})"),
+            BlockedResource::ChainAdmission { scope, root } => match scope {
+                Some(scope) => write!(f, "ChainAdmission(scope={scope}, root={root})"),
+                None => write!(f, "ChainAdmission(root={root})"),
+            },
             BlockedResource::SlotShare { lane } => write!(f, "SlotShare(lane={lane})"),
             BlockedResource::LimitKeyConcurrency {
                 scope,

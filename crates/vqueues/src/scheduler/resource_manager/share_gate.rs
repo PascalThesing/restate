@@ -10,15 +10,15 @@
 
 //! Weighted slot shares, enforced at admission.
 //!
-//! A new chain start (a root's first run) whose lane already holds its
+//! A new start (a first run with no parent) whose lane already holds its
 //! weighted share while other lanes wait is blocked *here*, before it asks the
 //! invoker for a slot. It sleeps until the node's shares change (a slot is
 //! returned or the waiting set changes) and is then woken only if its lane has
 //! headroom. Parking it in the invoker queue instead made the scheduler
 //! re-poll every capped start on every freed slot.
 //!
-//! The weight is a distribution, not a count: each waiting lane gets
-//! `capacity × weight / Σ waiting weights`, and a lane that is not waiting (no
+//! The weight is a distribution, not a count: each waiting group gets
+//! `capacity × weight / Σ waiting weights`, and a group that is not waiting (no
 //! demand, or held back by its chain admission limit) keeps only what it
 //! holds, leaving the rest of its share to the others.
 
@@ -26,19 +26,37 @@ use std::collections::{HashMap, VecDeque};
 
 use slotmap::SecondaryMap;
 
-use restate_worker_api::invoker::slot_shares::{ShareSubscription, SlotShares};
+use restate_worker_api::invoker::slot_shares::{OwnedShareLane, ShareLane, ShareSubscription, SlotShares};
 
 use crate::scheduler::VQueueHandle;
+
+/// A lane without its weights: the key of a blocked-start queue.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LaneKey {
+    scope: bool,
+    group: String,
+    lane: String,
+}
+
+impl LaneKey {
+    fn of(lane: &OwnedShareLane) -> Self {
+        Self {
+            scope: lane.scope,
+            group: lane.group.clone(),
+            lane: lane.lane.clone(),
+        }
+    }
+}
 
 pub(super) struct ShareGate {
     shares: SlotShares,
     sub: ShareSubscription,
     /// Blocked starts and the lane each one is counted as waiting in.
-    blocked: SecondaryMap<VQueueHandle, (String, u32)>,
-    /// Per lane: weight and the blocked starts in arrival order. A woken start
-    /// leaves the queue but stays in `blocked` (still waiting) until it
-    /// re-polls.
-    lanes: HashMap<String, (u32, VecDeque<VQueueHandle>)>,
+    blocked: SecondaryMap<VQueueHandle, OwnedShareLane>,
+    /// Per lane: the latest weights and the blocked starts in arrival order.
+    /// A woken start leaves the queue but stays in `blocked` (still waiting)
+    /// until it re-polls.
+    lanes: HashMap<LaneKey, (OwnedShareLane, VecDeque<VQueueHandle>)>,
 }
 
 impl ShareGate {
@@ -56,29 +74,32 @@ impl ShareGate {
         self.shares.is_enabled()
     }
 
-    /// May this new chain start of `lane` proceed to the invoker? If not it
-    /// is registered as blocked (and as its lane waiting).
-    pub(super) fn admit(&mut self, vqueue: VQueueHandle, lane: (String, u32)) -> bool {
-        if self.shares.may_take(&lane.0, lane.1) {
+    /// May this new start of `lane` proceed? If not it is registered as
+    /// blocked (and as its lane waiting).
+    pub(super) fn admit(&mut self, vqueue: VQueueHandle, lane: ShareLane<'_>) -> bool {
+        if self.shares.may_take(lane) {
             self.remove(vqueue);
             return true;
         }
         match self.blocked.get(vqueue) {
-            Some((key, weight)) if *key == lane.0 && *weight == lane.1 => {
+            Some(b) if b.same_lane(lane) && b.as_lane() == lane => {
                 // woken but beaten to the slot: keep its turn
-                let entry = self.lanes.entry(lane.0).or_default();
-                entry.0 = lane.1;
+                let entry = self.lanes.entry(LaneKey::of(b)).or_insert_with(|| (b.clone(), VecDeque::new()));
                 if !entry.1.contains(&vqueue) {
                     entry.1.push_front(vqueue);
                 }
             }
             _ => {
                 self.remove(vqueue);
-                self.shares.set_waiting(&lane.0, lane.1, 1);
-                let entry = self.lanes.entry(lane.0.clone()).or_default();
-                entry.0 = lane.1;
+                self.shares.set_waiting(lane, 1);
+                let owned = OwnedShareLane::from_lane(lane);
+                let entry = self
+                    .lanes
+                    .entry(LaneKey::of(&owned))
+                    .or_insert_with(|| (owned.clone(), VecDeque::new()));
+                entry.0 = owned.clone();
                 entry.1.push_back(vqueue);
-                self.blocked.insert(vqueue, lane);
+                self.blocked.insert(vqueue, owned);
             }
         }
         false
@@ -86,8 +107,9 @@ impl ShareGate {
 
     /// Forget `vqueue` (admitted, removed, or its head changed).
     pub(super) fn remove(&mut self, vqueue: VQueueHandle) {
-        if let Some((key, weight)) = self.blocked.remove(vqueue) {
-            self.shares.set_waiting(&key, weight, -1);
+        if let Some(lane) = self.blocked.remove(vqueue) {
+            self.shares.set_waiting(lane.as_lane(), -1);
+            let key = LaneKey::of(&lane);
             if let Some((_, q)) = self.lanes.get_mut(&key) {
                 if let Some(pos) = q.iter().position(|h| *h == vqueue) {
                     q.remove(pos);
@@ -107,8 +129,8 @@ impl ShareGate {
         if self.blocked.is_empty() || !changed {
             return;
         }
-        for (key, (weight, q)) in self.lanes.iter_mut() {
-            let room = self.shares.headroom(key, *weight) as usize;
+        for (lane, q) in self.lanes.values_mut() {
+            let room = self.shares.headroom(lane.as_lane()) as usize;
             for _ in 0..room.min(q.len()) {
                 woken.extend(q.pop_front());
             }
@@ -120,8 +142,8 @@ impl Drop for ShareGate {
     /// The shares are node-wide and outlive this partition's leadership: give
     /// back every waiting registration, or the lane would look waiting forever.
     fn drop(&mut self) {
-        for (_, (key, weight)) in self.blocked.drain() {
-            self.shares.set_waiting(&key, weight, -1);
+        for (_, lane) in self.blocked.drain() {
+            self.shares.set_waiting(lane.as_lane(), -1);
         }
     }
 }
@@ -132,23 +154,34 @@ mod tests {
 
     use slotmap::SlotMap;
 
+    use restate_worker_api::invoker::slot_shares::GroupKey;
+
     use super::*;
+
+    fn lane<'a>(scope: &'a str, svc: &'a str) -> ShareLane<'a> {
+        ShareLane {
+            group: GroupKey::Scope(scope),
+            group_weight: 1,
+            lane: svc,
+            lane_weight: 1,
+        }
+    }
 
     /// A start over its share blocks without taking a slot and is woken, once,
     /// when a slot of the pool is returned — not before.
     #[test]
     fn blocked_start_wakes_on_returned_slot() {
         let mut handles = SlotMap::<VQueueHandle, ()>::with_key();
-        let (hog2, rail) = (handles.insert(()), handles.insert(()));
+        let hog2 = handles.insert(());
         let shares = SlotShares::new(NonZeroUsize::new(2), true);
         let mut gate = ShareGate::new(shares.clone());
         let cx = std::task::Context::from_waker(std::task::Waker::noop());
-        let hog = ("s/hog".to_owned(), 1);
+        let (hog, rail) = (lane("hog", "Emit"), lane("rail", "Wf"));
 
-        let hog_slot = shares.take(&hog.0, hog.1);
-        shares.set_waiting("s/rail", 1, 1); // the rail waits: shares apply
-        let _rail_slot = shares.take("s/rail", 1);
-        assert!(!gate.admit(hog2, hog.clone()), "hog holds its share (1 of 2)");
+        let hog_slot = shares.take(hog);
+        shares.set_waiting(rail, 1); // the rail waits: shares apply
+        let _rail_slot = shares.take(rail);
+        assert!(!gate.admit(hog2, hog), "hog holds its share (1 of 2)");
         let mut woken = Vec::new();
         gate.poll_wake(&cx, &mut woken);
         assert!(woken.is_empty(), "no share change yet");
@@ -160,7 +193,6 @@ mod tests {
         gate.poll_wake(&cx, &mut woken);
         assert!(woken.is_empty(), "woken once per change");
         assert!(gate.admit(hog2, hog), "now within its share");
-        let _ = rail;
     }
 
     /// Removing a blocked start stops counting its lane as waiting, so the
@@ -171,13 +203,14 @@ mod tests {
         let hog2 = handles.insert(());
         let shares = SlotShares::new(NonZeroUsize::new(4), true);
         let mut gate = ShareGate::new(shares.clone());
-        let _h: Vec<_> = (0..2).map(|_| shares.take("s/hog", 1)).collect();
-        let _r: Vec<_> = (0..2).map(|_| shares.take("s/rail", 1)).collect();
-        shares.set_waiting("s/rail", 1, 1);
-        assert!(!gate.admit(hog2, ("s/hog".to_owned(), 1)));
-        assert_eq!(shares.headroom("s/rail", 1), 0, "split 2/2, pool full");
+        let (hog, rail) = (lane("hog", "Emit"), lane("rail", "Wf"));
+        let _h: Vec<_> = (0..2).map(|_| shares.take(hog)).collect();
+        let _r: Vec<_> = (0..2).map(|_| shares.take(rail)).collect();
+        shares.set_waiting(rail, 1);
+        assert!(!gate.admit(hog2, hog));
+        assert_eq!(shares.headroom(rail), 0, "split 2/2, pool full");
         gate.remove(hog2);
-        assert!(shares.may_take("s/rail", 1), "hog no longer waits: rail uncapped");
+        assert!(shares.may_take(rail), "hog no longer waits: rail uncapped");
     }
 
     /// Losing leadership drops the gate; its blocked starts must stop
@@ -187,14 +220,15 @@ mod tests {
         let mut handles = SlotMap::<VQueueHandle, ()>::with_key();
         let hog2 = handles.insert(());
         let shares = SlotShares::new(NonZeroUsize::new(2), true);
-        let _h = shares.take("s/hog", 1);
-        let _r = shares.take("s/rail", 1);
-        shares.set_waiting("s/rail", 1, 1);
+        let (hog, rail) = (lane("hog", "Emit"), lane("rail", "Wf"));
+        let _h = shares.take(hog);
+        let _r = shares.take(rail);
+        shares.set_waiting(rail, 1);
         let mut gate = ShareGate::new(shares.clone());
-        assert!(!gate.admit(hog2, ("s/hog".to_owned(), 1)));
-        shares.set_waiting("s/rail", 1, -1);
-        assert!(!shares.may_take("s/rail", 1), "hog waits: rail capped at its share");
+        assert!(!gate.admit(hog2, hog));
+        shares.set_waiting(rail, -1);
+        assert!(!shares.may_take(rail), "hog waits: rail capped at its share");
         drop(gate);
-        assert!(shares.may_take("s/rail", 1), "no ghost waiter after the gate is gone");
+        assert!(shares.may_take(rail), "no ghost waiter after the gate is gone");
     }
 }

@@ -1231,6 +1231,7 @@ impl<S> StateMachineApplyContext<'_, S> {
             chain_root: (self.is_chain_root_queues_enabled()
                 && is_chain_root(&metadata.source, &metadata.invocation_target))
                 .then(|| ReString::from(metadata.invocation_target.service_name().to_string())),
+            has_parent: matches!(metadata.source, Source::Service(..)),
             ..Default::default()
         };
         VQueue::vqueue_from_invocation_target(

@@ -379,6 +379,14 @@ pub struct InvokerOptions {
     /// idles while someone waits. Off by default.
     pub weighted_slot_shares: bool,
 
+    /// # In-flight priority burst
+    ///
+    /// With weighted slot shares on, work of chains that already run
+    /// (children, resumes) takes freed invoker slots before new starts. After
+    /// this many consecutive in-flight grants while new starts wait, one
+    /// freed slot goes to a new start, so new starts can never be starved.
+    pub in_flight_priority_burst: NonZeroU32,
+
     /// # Eager state size limit (since v1.7.0)
     ///
     /// Maximum total size (in bytes) of state entries to send eagerly in the StartMessage.
@@ -666,6 +674,7 @@ impl Default for InvokerOptions {
             concurrent_invocations_limit: Some(NonZeroUsize::new(1000).expect("is non zero")),
             chain_admission: ChainAdmissionOptions::default(),
             weighted_slot_shares: false,
+            in_flight_priority_burst: NonZeroU32::new(8).expect("non zero"),
             eager_state_size_limit: None,
             disable_eager_state: false,
             invocation_throttling: None,

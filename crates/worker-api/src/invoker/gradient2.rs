@@ -25,9 +25,9 @@ use std::time::Duration;
 use metrics::{Counter, Gauge, Histogram, counter, gauge, histogram};
 use tokio::time::Instant;
 
-use crate::metric_definitions::{
-    CHAIN_ACTIVE_TIME_SECONDS, CHAIN_DRIFT_DECAY_TOTAL, CHAIN_GRADIENT,
-    CHAIN_IN_PROGRESS, CHAIN_LIMIT, CHAIN_LONG_RTT_MS, CHAIN_SAMPLES_TOTAL, CHAIN_SHORT_RTT_MS,
+use super::chain_metrics::{
+    CHAIN_ACTIVE_TIME_SECONDS, CHAIN_DRIFT_DECAY_TOTAL, CHAIN_GRADIENT, CHAIN_LIMIT,
+    CHAIN_LONG_RTT_MS, CHAIN_RUNNING, CHAIN_SAMPLES_TOTAL, CHAIN_SHORT_RTT_MS,
     CHAIN_UPDATES_TOTAL,
 };
 
@@ -46,7 +46,7 @@ pub struct ControllerParams {
 /// Which metric family a controller reports into.
 #[derive(Debug, Clone, Copy)]
 pub enum ControllerFamily {
-    /// Per root service (chain admission); label `root`.
+    /// Per scope and root service (chain admission); labels `scope`, `root`.
     Chain,
 }
 
@@ -67,7 +67,7 @@ const CHAIN_METRICS: MetricNames = MetricNames {
     label: "root",
     samples: CHAIN_SAMPLES_TOTAL,
     hold_time: CHAIN_ACTIVE_TIME_SECONDS,
-    in_flight: CHAIN_IN_PROGRESS,
+    in_flight: CHAIN_RUNNING,
     limit: CHAIN_LIMIT,
     long_rtt: CHAIN_LONG_RTT_MS,
     short_rtt: CHAIN_SHORT_RTT_MS,
@@ -94,6 +94,9 @@ pub enum UpdateOutcome {
     ClampMin,
     ClampMax,
     AppLimited,
+    /// The limit would have grown, but it was not the binding gate (the
+    /// share or the pool held the root back): kept as is (RFC 7661).
+    ShareLimited,
     IntervalSkip,
 }
 
@@ -121,6 +124,7 @@ pub struct Gradient2Controller {
     m_out_clamp_min: Counter,
     m_out_clamp_max: Counter,
     m_out_app_limited: Counter,
+    m_out_share_limited: Counter,
 
     // -- controller state ---------------------------------------------------
     limit: f64,
@@ -136,8 +140,8 @@ impl Gradient2Controller {
     pub fn new(
         params: ControllerParams,
         family: ControllerFamily,
+        scope_label: String,
         label: String,
-        partition_label: String,
         now: Instant,
     ) -> Self {
         let names: &'static MetricNames = match family {
@@ -153,26 +157,27 @@ impl Gradient2Controller {
             .unwrap_or((min * 8.0).min(max))
             .clamp(min, max);
         let key = names.label;
-        let outcome_counter = |o: &'static str| counter!(names.updates, key => label.clone(), "partition_id" => partition_label.clone(), "outcome" => o);
+        let outcome_counter = |o: &'static str| counter!(names.updates, "scope" => scope_label.clone(), key => label.clone(), "outcome" => o);
         let controller = Self {
             params,
             min,
             max,
             tolerance,
             smoothing,
-            m_samples: counter!(names.samples, key => label.clone(), "partition_id" => partition_label.clone()),
-            m_hold_time: histogram!(names.hold_time, key => label.clone()),
-            m_in_flight: gauge!(names.in_flight, key => label.clone(), "partition_id" => partition_label.clone()),
-            m_limit: gauge!(names.limit, key => label.clone(), "partition_id" => partition_label.clone()),
-            m_long_rtt: gauge!(names.long_rtt, key => label.clone(), "partition_id" => partition_label.clone()),
-            m_short_rtt: gauge!(names.short_rtt, key => label.clone(), "partition_id" => partition_label.clone()),
-            m_gradient: gauge!(names.gradient, key => label.clone(), "partition_id" => partition_label.clone()),
-            m_drift_decay: counter!(names.drift_decay, key => label.clone(), "partition_id" => partition_label.clone()),
+            m_samples: counter!(names.samples, "scope" => scope_label.clone(), key => label.clone()),
+            m_hold_time: histogram!(names.hold_time, "scope" => scope_label.clone(), key => label.clone()),
+            m_in_flight: gauge!(names.in_flight, "scope" => scope_label.clone(), key => label.clone()),
+            m_limit: gauge!(names.limit, "scope" => scope_label.clone(), key => label.clone()),
+            m_long_rtt: gauge!(names.long_rtt, "scope" => scope_label.clone(), key => label.clone()),
+            m_short_rtt: gauge!(names.short_rtt, "scope" => scope_label.clone(), key => label.clone()),
+            m_gradient: gauge!(names.gradient, "scope" => scope_label.clone(), key => label.clone()),
+            m_drift_decay: counter!(names.drift_decay, "scope" => scope_label.clone(), key => label.clone()),
             m_out_increase: outcome_counter("increase"),
             m_out_decrease: outcome_counter("decrease"),
             m_out_clamp_min: outcome_counter("clamp_min"),
             m_out_clamp_max: outcome_counter("clamp_max"),
             m_out_app_limited: outcome_counter("app_limited"),
+            m_out_share_limited: outcome_counter("share_limited"),
             limit: initial,
             long_ema: 0.0,
             warmup_count: 0,
@@ -199,7 +204,19 @@ impl Gradient2Controller {
     /// Feeds one permit-hold-time sample. Returns the update outcome; on
     /// [`UpdateOutcome::Increase`] the caller should wake waiters blocked on
     /// this rule.
-    pub fn on_sample(&mut self, hold: Duration, in_flight: u32, now: Instant) -> UpdateOutcome {
+    ///
+    /// `in_flight` is the number of chains that actually run; `limit_binding`
+    /// says whether the limit itself held starts back since the last update
+    /// (the flight size reached the limit). Without that, the limit never
+    /// grows: growing a limit that was not used would only inflate it
+    /// (RFC 7661). Shrinking on rising latency stays allowed either way.
+    pub fn on_sample(
+        &mut self,
+        hold: Duration,
+        in_flight: u32,
+        limit_binding: bool,
+        now: Instant,
+    ) -> UpdateOutcome {
         self.m_samples.increment(1);
         self.m_hold_time.record(hold.as_secs_f64());
 
@@ -247,7 +264,10 @@ impl Gradient2Controller {
         let mut new_limit = self.limit * gradient + QUEUE_SIZE;
         new_limit = self.limit * (1.0 - self.smoothing) + new_limit * self.smoothing;
 
-        let outcome = if new_limit <= self.min {
+        let outcome = if new_limit > self.limit && !limit_binding {
+            new_limit = self.limit;
+            UpdateOutcome::ShareLimited
+        } else if new_limit <= self.min {
             new_limit = self.min;
             UpdateOutcome::ClampMin
         } else if new_limit >= self.max {
@@ -274,6 +294,7 @@ impl Gradient2Controller {
             UpdateOutcome::ClampMin => self.m_out_clamp_min.increment(1),
             UpdateOutcome::ClampMax => self.m_out_clamp_max.increment(1),
             UpdateOutcome::AppLimited => self.m_out_app_limited.increment(1),
+            UpdateOutcome::ShareLimited => self.m_out_share_limited.increment(1),
             UpdateOutcome::IntervalSkip => {}
         }
         self.m_short_rtt.set(sample_ms);
@@ -313,7 +334,7 @@ mod tests {
     }
 
     fn controller(now: Instant) -> Gradient2Controller {
-        Gradient2Controller::new(params(), ControllerFamily::Chain, "payment".into(), "0".into(), now)
+        Gradient2Controller::new(params(), ControllerFamily::Chain, "payment".into(), "Workflow".into(), now)
     }
 
     fn ms(v: u64) -> Duration {
@@ -326,7 +347,7 @@ mod tests {
         for _ in 0..n {
             *now += Duration::from_millis(1050);
             let in_flight = c.current_limit().get();
-            c.on_sample(latency, in_flight, *now);
+            c.on_sample(latency, in_flight, true, *now);
         }
     }
 
@@ -371,7 +392,7 @@ mod tests {
         let before = c.limit_f64();
         // 4x usual latency -> gradient floor 0.5; shrink is smoothing-bounded
         now += Duration::from_millis(1050);
-        c.on_sample(ms(400), c.current_limit().get(), now);
+        c.on_sample(ms(400), c.current_limit().get(), true, now);
         let after = c.limit_f64();
         assert!(after < before);
         assert!(after > before * 0.89, "shrink must be <= ~10%/update");
@@ -410,7 +431,7 @@ mod tests {
             let latency_us = 100 + (seed >> 33) % 8_000_000;
             now += Duration::from_millis(300);
             let in_flight = ((seed >> 7) % 400) as u32;
-            c.on_sample(Duration::from_micros(latency_us), in_flight, now);
+            c.on_sample(Duration::from_micros(latency_us), in_flight, (seed >> 5) & 1 == 0, now);
             let l = c.limit_f64();
             assert!((4.0..=300.0).contains(&l), "limit out of bounds: {l}");
             assert!(l.is_finite());
@@ -425,7 +446,7 @@ mod tests {
         for _ in 0..50 {
             now += Duration::from_millis(1050);
             // healthy latency but almost no in-flight demand
-            c.on_sample(ms(100), 1, now);
+            c.on_sample(ms(100), 1, true, now);
         }
         assert_eq!(c.current_limit().get(), before, "app-limited must not grow");
     }
@@ -439,7 +460,7 @@ mod tests {
         // 100 samples within one second: all gated, limit unchanged
         for _ in 0..100 {
             now += Duration::from_millis(5);
-            let out = c.on_sample(ms(100), c.current_limit().get(), now);
+            let out = c.on_sample(ms(100), c.current_limit().get(), true, now);
             assert_eq!(out, UpdateOutcome::IntervalSkip);
         }
         assert_eq!(c.limit_f64(), before);
@@ -465,5 +486,33 @@ mod tests {
         drive(&mut c, &mut now, Duration::from_secs(3600), 5);
         assert!(c.limit_f64().is_finite());
         assert!((4.0..=300.0).contains(&c.limit_f64()));
+    }
+
+    /// A limit that is not the binding gate never grows, even with flat
+    /// latency and full demand: it is reported `ShareLimited` and kept.
+    /// Shrinking on a latency rise stays allowed.
+    #[tokio::test(start_paused = true)]
+    async fn no_growth_unless_the_limit_binds() {
+        let mut now = Instant::now();
+        let mut c = controller(now);
+        let start = c.current_limit().get();
+        for _ in 0..30 {
+            now += Duration::from_millis(1050);
+            let out = c.on_sample(ms(100), c.current_limit().get(), false, now);
+            assert!(
+                matches!(out, UpdateOutcome::ShareLimited | UpdateOutcome::IntervalSkip),
+                "got {out:?}"
+            );
+        }
+        assert_eq!(c.current_limit().get(), start, "kept while not binding");
+        // binding again: growth resumes
+        drive(&mut c, &mut now, ms(100), 5);
+        assert!(c.current_limit().get() > start);
+        // not binding, but latency 4x: still shrinks
+        let before = c.current_limit().get();
+        now += Duration::from_millis(1050);
+        let out = c.on_sample(ms(400), c.current_limit().get(), false, now);
+        assert_eq!(out, UpdateOutcome::Decrease);
+        assert!(c.current_limit().get() < before);
     }
 }

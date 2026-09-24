@@ -237,6 +237,8 @@ where
             invoker_memory_pool,
             config.worker.invoker.per_invocation_initial_memory,
             config.worker.invoker.weighted_slot_shares,
+            config.worker.invoker.in_flight_priority_burst.get(),
+            &config.worker.invoker.chain_admission,
         );
 
         let (tx, rx) = mpsc::channel(updateable_config.pinned().worker.internal_queue_length());

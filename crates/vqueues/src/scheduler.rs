@@ -42,7 +42,7 @@ mod vqueue_state;
 
 // Re-exports
 pub use eligible::{SchedulingGroup, WeightResolver};
-pub use resource_manager::{ChainAdmissionConfig, ControllerParams, ResourceManager};
+pub use resource_manager::{ChainAdmissionConfig, ChainNode, ControllerParams, ResourceManager};
 
 /// Live map of scope name → scheduling weight, fed from scope-level exact rules
 /// (`restate rules set <scope> --weight N`). Shared between the scheduler service

@@ -33,29 +33,27 @@ pub const VQUEUE_DEPLOYMENT_CONCURRENCY_WAIT_MS: &str =
 pub const ACTION_YIELD: &str = "yield";
 pub const ACTION_RUN: &str = "run";
 
-// -- Chain admission (automatic Gradient2 per root service) -----------------
-// Labels: `root` (the root service name) and `partition_id`.
-pub const CHAIN_LIMIT: &str = "restate.chain_admission.limit";
-pub const CHAIN_IN_PROGRESS: &str = "restate.chain_admission.in_progress";
-pub const CHAIN_GRADIENT: &str = "restate.chain_admission.gradient";
-pub const CHAIN_SHORT_RTT_MS: &str = "restate.chain_admission.short_rtt_ms";
-pub const CHAIN_LONG_RTT_MS: &str = "restate.chain_admission.long_rtt_ms";
-pub const CHAIN_UPDATES_TOTAL: &str = "restate.chain_admission.updates.total";
-pub const CHAIN_DRIFT_DECAY_TOTAL: &str = "restate.chain_admission.drift_decay.total";
-pub const CHAIN_SAMPLES_TOTAL: &str = "restate.chain_admission.samples.total";
-pub const CHAIN_ACTIVE_TIME_SECONDS: &str = "restate.chain_admission.active_time.seconds";
-pub const CHAIN_WAITERS: &str = "restate.chain_admission.waiters";
+// -- Chain admission (automatic Gradient2 per scope and root service, node-wide) --
+pub use restate_worker_api::invoker::chain_metrics::{
+    CHAIN_ACTIVE_TIME_SECONDS, CHAIN_IN_PROGRESS, CHAIN_LIMIT, CHAIN_RUNNING,
+    CHAIN_SAMPLES_TOTAL, CHAIN_UPDATES_TOTAL, CHAIN_WAITERS,
+};
 
 pub fn describe_metrics() {
     describe_gauge!(
         CHAIN_LIMIT,
         Unit::Count,
-        "Chain admission: learned limit of chains in progress per root service and partition"
+        "Chain admission: learned limit of chains in progress per scope and root service (node-wide)"
     );
     describe_gauge!(
         CHAIN_IN_PROGRESS,
         Unit::Count,
-        "Chain admission: chains currently holding a permit per root service and partition"
+        "Chain admission: chains currently holding a permit per scope and root service (node-wide)"
+    );
+    describe_gauge!(
+        CHAIN_RUNNING,
+        Unit::Count,
+        "Chain admission: admitted chains that hold their invoker slot (the controller's flight size)"
     );
     describe_gauge!(
         CHAIN_WAITERS,
