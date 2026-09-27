@@ -624,11 +624,13 @@ pub struct ChainAdmissionOptions {
     pub enabled: bool,
     /// # Minimum chains in progress
     ///
-    /// Per partition. The limit never drops below this, so samples keep flowing.
+    /// Node-wide, per (scope, root service). The limit never drops below this,
+    /// so samples keep flowing; the initial limit is eight times this value.
     pub min: NonZeroU32,
     /// # Maximum chains in progress
     ///
-    /// Per partition. Unset: the invoker's `concurrent-invocations-limit`.
+    /// Node-wide, per (scope, root service). Unset: the invoker's
+    /// `concurrent-invocations-limit`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max: Option<NonZeroU32>,
     /// # Tolerance (permille)

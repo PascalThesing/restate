@@ -42,9 +42,14 @@ impl PermitBuilder {
         self.user_permit.as_ref().and_then(|p| p.chain_entry)
     }
 
-    /// Forgets the staged chain permit (the caller released it).
-    pub fn take_chain_entry(&mut self) -> Option<EntryId> {
-        self.user_permit.as_mut().and_then(|p| p.chain_entry.take())
+    /// Takes the whole user permit out, as a builder of its own, so it can be
+    /// reverted later (locks, concurrency counters and the chain permit all
+    /// go back). The next poll then re-enters the user stage from scratch.
+    pub fn take_user_permit(&mut self) -> Option<PermitBuilder> {
+        self.user_permit.take().map(|user_permit| PermitBuilder {
+            user_permit: Some(user_permit),
+            system_permit: SystemPermit::default(),
+        })
     }
 
     pub fn has_invoker_permit(&self) -> bool {

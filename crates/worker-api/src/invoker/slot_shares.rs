@@ -288,7 +288,13 @@ impl State {
             u64::MAX
         };
 
-        // level 2: lanes within the group
+        // level 2: lanes within the group. An uncontended group's budget for
+        // its lanes is the pool itself (never multiply u64::MAX).
+        let group_budget = if group_share == u64::MAX {
+            self.capacity as u64
+        } else {
+            group_share
+        };
         let mut lane_others_waiting = false;
         let mut lane_reserved: u64 = 0;
         let mut lane_waiting_weight: u64 = lane.lane_weight.max(1) as u64;
@@ -306,7 +312,7 @@ impl State {
             }
         }
         let lane_share = if lane_others_waiting {
-            let remaining = group_share.saturating_sub(lane_reserved);
+            let remaining = group_budget.saturating_sub(lane_reserved);
             (remaining * lane.lane_weight.max(1) as u64)
                 .div_ceil(lane_waiting_weight)
                 .max(1)
@@ -433,6 +439,8 @@ impl SlotShares {
     }
 
     /// A queue of `lane` started (`+1`) or stopped (`-1`) waiting for a slot.
+    /// Only a start refreshes the weights: a stop carries the weights the
+    /// queue parked with, which may be stale by now.
     pub fn set_waiting(&self, lane: ShareLane<'_>, delta: i32) {
         let Some(state) = &self.0 else {
             return;
@@ -440,11 +448,18 @@ impl SlotShares {
         let wake = {
             let mut st = state.lock().expect("slot shares lock poisoned");
             let scope = lane.group.is_scope();
-            let g = st.group_mut(lane.group, lane.group_weight);
-            g.waiting = g.waiting.saturating_add_signed(delta);
-            let lane_name = g.ensure_lane(lane.lane, lane.lane_weight);
-            let l = g.lanes.get_mut(&*lane_name).expect("ensured");
-            l.waiting = l.waiting.saturating_add_signed(delta);
+            if delta >= 0 {
+                let g = st.group_mut(lane.group, lane.group_weight);
+                g.waiting = g.waiting.saturating_add_signed(delta);
+                let lane_name = g.ensure_lane(lane.lane, lane.lane_weight);
+                let l = g.lanes.get_mut(&*lane_name).expect("ensured");
+                l.waiting = l.waiting.saturating_add_signed(delta);
+            } else if let Some(g) = st.map_mut(scope).get_mut(lane.group.name()) {
+                g.waiting = g.waiting.saturating_add_signed(delta);
+                if let Some(l) = g.lanes.get_mut(lane.lane) {
+                    l.waiting = l.waiting.saturating_add_signed(delta);
+                }
+            }
             st.gc(scope, lane.group.name(), lane.lane);
             st.notify.changed()
         };
@@ -637,6 +652,38 @@ mod tests {
         let a = fill(&s, scoped);
         let b = fill(&s, unscoped);
         assert_eq!((a.len(), b.len()), (4, 4), "two groups, not one");
+    }
+
+    /// Lanes of a group that no other group contends with split the pool
+    /// itself by lane weight (no unbounded arithmetic).
+    #[test]
+    fn uncontended_group_splits_its_lanes_over_the_pool() {
+        let s = shares(12);
+        let a = lane("payment", 1, "A", 2);
+        let b = lane("payment", 1, "B", 1);
+        s.set_waiting(a, 1);
+        s.set_waiting(b, 1);
+        assert_eq!(s.headroom(a), 8, "weight 2 of 3 over the 12-slot pool");
+        assert_eq!(s.headroom(b), 4);
+        let _got = fill(&s, a);
+        assert_eq!(_got.len(), 8);
+    }
+
+    /// A stop (`-1`) carries the weights the queue parked with; it must not
+    /// overwrite a weight that changed since.
+    #[test]
+    fn unpark_does_not_clobber_weights() {
+        let s = shares(12);
+        let old = lane("payment", 1, "A", 1);
+        let new = lane("payment", 1, "A", 2);
+        let b = lane("payment", 1, "B", 1);
+        s.set_waiting(old, 1); // parked with lane weight 1
+        s.set_waiting(new, 1); // a later waiter brings weight 2
+        s.set_waiting(b, 1);
+        s.set_waiting(old, -1); // the first one leaves, still quoting weight 1
+        // B's share is computed from A's *stored* weight: 12 x 1/3 with A at
+        // weight 2, 12 x 1/2 if the stop had clobbered it back to 1
+        assert_eq!(s.headroom(b), 4, "lane A keeps weight 2");
     }
 
     /// Disabled shares never cap.

@@ -89,9 +89,10 @@ pub struct ResourceManager {
     chain: ChainAdmission,
     /// Weighted slot shares for new starts, enforced before the invoker.
     share_gate: ShareGate,
-    /// Queues to wake on the next `poll_resources` (a chain permit given back
-    /// at claim time, where the eligibility tracker is not at hand).
-    deferred_wake: Vec<VQueueHandle>,
+    /// User permits to revert on the next `poll_resources` (a start refused
+    /// at claim time gives everything back, but the eligibility tracker is
+    /// not at hand there).
+    deferred_revert: Vec<PermitBuilder>,
     rx: mpsc::UnboundedReceiver<ResourceManagerUpdate>,
     // We need to keep this alive to:
     // - Keep the receiver alive even if we don't have any resource permits handed out
@@ -134,7 +135,7 @@ impl ResourceManager {
             invoker_memory: InvokerMemoryLimiter::new(memory_pool, initial_invocation_memory),
             user_limiter: UserLimiter::create(),
             chain: ChainAdmission::new(chain_node, partition_label),
-            deferred_wake: Vec::new(),
+            deferred_revert: Vec::new(),
             locks,
             rx,
             tx: _tx,
@@ -249,6 +250,30 @@ impl ResourceManager {
         }
     }
 
+    /// Records that `vqueue` blocks on `resource`, after leaving every other
+    /// waiter registration it may still hold from an earlier poll (a queue
+    /// woken by one resource can block on another; its old registration would
+    /// otherwise count it as waiting there forever).
+    fn block_on(
+        &mut self,
+        vqueue: VQueueHandle,
+        chain_key: Option<&ChainKey>,
+        resource: ResourceKind,
+    ) -> AcquireOutcome {
+        if !matches!(resource, ResourceKind::SlotShare { .. }) {
+            self.share_gate.remove(vqueue);
+        }
+        if !matches!(resource, ResourceKind::ChainAdmission { .. })
+            && let Some(key) = chain_key
+        {
+            self.chain.remove_waiter(vqueue, key);
+        }
+        if !matches!(resource, ResourceKind::InvokerConcurrency) {
+            self.invoker_concurrency.remove_from_waiters(vqueue);
+        }
+        AcquireOutcome::BlockedOn(resource)
+    }
+
     pub(super) fn poll_acquire_permit(
         &mut self,
         cx: &mut std::task::Context<'_>,
@@ -259,6 +284,12 @@ impl ResourceManager {
         first_run: bool,
         current_permit: &mut PermitBuilder,
     ) -> AcquireOutcome {
+        let chain_key = if key.kind() == EntryKind::Invocation {
+            self.chain
+                .key_of(metadata.chain_root.as_deref(), meta.scope().as_ref())
+        } else {
+            None
+        };
         if !current_permit.has_user_permit() {
             // we need to acquire user permit first
 
@@ -279,7 +310,7 @@ impl ResourceManager {
                     provisional.set_lock(meta.scope().clone(), lock_name.clone());
                 } else {
                     self.locks.add_to_waiters(vqueue, meta.scope(), lock_name);
-                    return AcquireOutcome::BlockedOn(ResourceKind::Lock {
+                    return self.block_on(vqueue, chain_key.as_ref(), ResourceKind::Lock {
                         scope: meta.scope().clone(),
                         lock_name: lock_name.clone(),
                     });
@@ -305,7 +336,7 @@ impl ResourceManager {
                         meta.limit_key(),
                         blocked_level,
                     );
-                    return AcquireOutcome::BlockedOn(ResourceKind::LimitKeyConcurrency {
+                    return self.block_on(vqueue, chain_key.as_ref(), ResourceKind::LimitKeyConcurrency {
                         scope: scope.clone(),
                         limit_key: meta.limit_key().clone(),
                         blocked_level,
@@ -322,9 +353,6 @@ impl ResourceManager {
 
             if key.kind() == EntryKind::Invocation {
                 let now = tokio::time::Instant::now();
-                let chain_key = self
-                    .chain
-                    .key_of(metadata.chain_root.as_deref(), meta.scope().as_ref());
                 // Weighted slot share, checked before chain admission so a
                 // start held back by its share never holds a chain permit.
                 // Only new starts (a first run nothing called) are subject
@@ -338,15 +366,13 @@ impl ResourceManager {
                     let group = SchedulingGroup::of(meta);
                     let lane = self.invoker_concurrency.lane_of(&group, &service);
                     if !self.share_gate.admit(vqueue, lane) {
-                        // a stale chain-waiter registration must not eat the
-                        // wake budget of its key
-                        if let Some(k) = &chain_key {
-                            self.chain.remove_waiter(vqueue, k);
-                        }
-                        self.invoker_concurrency.remove_from_waiters(vqueue);
-                        return AcquireOutcome::BlockedOn(ResourceKind::SlotShare {
-                            lane: ReString::new(share_lane_label(&group, &service)),
-                        });
+                        return self.block_on(
+                            vqueue,
+                            chain_key.as_ref(),
+                            ResourceKind::SlotShare {
+                                lane: ReString::new(share_lane_label(&group, &service)),
+                            },
+                        );
                     }
                 }
 
@@ -355,18 +381,25 @@ impl ResourceManager {
                 // a chain permit before its first run (and again after an
                 // external wait or a pause). Children and resumes of a running
                 // chain are never gated here.
-                match self
-                    .chain
-                    .poll_admit(vqueue, *key.entry_id(), chain_key, first_run, now)
-                {
+                match self.chain.poll_admit(
+                    vqueue,
+                    *key.entry_id(),
+                    chain_key.clone(),
+                    first_run,
+                    now,
+                ) {
                     Admit::NotGated => {}
                     Admit::Admitted => provisional.set_chain_entry(*key.entry_id()),
-                    Admit::Blocked(chain_key) => {
-                        trace!(chain = %chain_key, "Chain admission limit reached");
-                        return AcquireOutcome::BlockedOn(ResourceKind::ChainAdmission {
-                            scope: chain_key.scope,
-                            root: chain_key.root,
-                        });
+                    Admit::Blocked(blocked) => {
+                        trace!(chain = %blocked, "Chain admission limit reached");
+                        return self.block_on(
+                            vqueue,
+                            chain_key.as_ref(),
+                            ResourceKind::ChainAdmission {
+                                scope: blocked.scope,
+                                root: blocked.root,
+                            },
+                        );
                     }
                 }
             }
@@ -401,21 +434,21 @@ impl ResourceManager {
                         if new_start {
                             let lane = self.invoker_concurrency.lane_of(&group, &service);
                             if !self.share_gate.admit(vqueue, lane) {
-                                self.invoker_concurrency.remove_from_waiters(vqueue);
-                                if let Some(entry_id) = current_permit.take_chain_entry() {
-                                    let now = tokio::time::Instant::now();
-                                    self.chain.release_unstarted(
-                                        entry_id,
-                                        now,
-                                        &mut self.deferred_wake,
-                                    );
-                                    if !self.deferred_wake.is_empty() {
-                                        cx.waker().wake_by_ref();
-                                    }
+                                // give the whole user permit back (lock,
+                                // counters, chain permit): the next poll
+                                // re-enters the user stage from scratch, so
+                                // chain admission is never skipped
+                                if let Some(builder) = current_permit.take_user_permit() {
+                                    self.deferred_revert.push(builder);
+                                    cx.waker().wake_by_ref();
                                 }
-                                return AcquireOutcome::BlockedOn(ResourceKind::SlotShare {
-                                    lane: ReString::new(share_lane_label(&group, &service)),
-                                });
+                                return self.block_on(
+                                    vqueue,
+                                    chain_key.as_ref(),
+                                    ResourceKind::SlotShare {
+                                        lane: ReString::new(share_lane_label(&group, &service)),
+                                    },
+                                );
                             }
                         } else {
                             self.share_gate.remove(vqueue);
@@ -428,7 +461,11 @@ impl ResourceManager {
                         &service,
                         new_start,
                     ) else {
-                        return AcquireOutcome::BlockedOn(ResourceKind::InvokerConcurrency);
+                        return self.block_on(
+                            vqueue,
+                            chain_key.as_ref(),
+                            ResourceKind::InvokerConcurrency,
+                        );
                     };
                     current_permit.set_invoker_permit(invoker_permit, slot_lease);
                 }
@@ -440,9 +477,11 @@ impl ResourceManager {
                             current_permit.set_throttling_permit(throttling_token);
                         }
                         ThrottlingAcquire::Blocked { estimated_retry_at } => {
-                            return AcquireOutcome::BlockedOn(ResourceKind::InvokerThrottling {
-                                estimated_retry_at,
-                            });
+                            return self.block_on(
+                                vqueue,
+                                chain_key.as_ref(),
+                                ResourceKind::InvokerThrottling { estimated_retry_at },
+                            );
                         }
                     }
                 }
@@ -504,7 +543,10 @@ impl ResourceManager {
         self.share_gate.poll_wake(cx, &mut share_woken);
         eligible.wake_up_queues(share_woken);
 
-        let mut chain_woken = std::mem::take(&mut self.deferred_wake);
+        for builder in std::mem::take(&mut self.deferred_revert) {
+            self.revert_permit_builder(eligible, builder);
+        }
+        let mut chain_woken = Vec::new();
         self.chain
             .poll_wake(cx, tokio::time::Instant::now(), &mut chain_woken);
         eligible.wake_up_queues(chain_woken);

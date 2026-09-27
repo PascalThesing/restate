@@ -248,6 +248,20 @@ impl InvokerConcurrencyLimiter {
         }
 
         if !self.cached_permit.is_empty() {
+            // With shares on, hand out one wake per cached permit: waking
+            // every waiter for one slot would let the scheduler's dispatch
+            // order, not this list, decide who gets it. (Without shares the
+            // wake-all-and-race behaviour stays as it always was.)
+            if self.shares.is_enabled() {
+                let outstanding = self
+                    .woken
+                    .keys()
+                    .filter(|h| self.parked.contains_key(*h))
+                    .count();
+                if outstanding >= self.cached_permit.units() {
+                    return Poll::Pending;
+                }
+            }
             // store this permit for the next poller: in-flight chain work
             // first, then new starts in WRR order
             // burst guard: after `priority_burst` in-flight grants in a row
@@ -504,6 +518,39 @@ mod tests {
             "a new start must not steal the permit set aside for in-flight work"
         );
         assert!(limiter.poll_acquire(&mut cx, child, &g_rail, &s_child, false).is_some());
+    }
+
+    /// With shares on, one freed slot wakes exactly one waiter (the child),
+    /// not everyone: a second poll for the same permit is Pending.
+    #[test]
+    fn one_freed_slot_wakes_one_waiter_when_prioritised() {
+        let mut handles = SlotMap::<VQueueHandle, ()>::with_key();
+        let holder = handles.insert(());
+        let start = handles.insert(());
+        let child = handles.insert(());
+        let (g, s_root, s_child) = (group("rail"), svc("root"), svc("child"));
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let one = NonZeroUsize::new(1).unwrap();
+        let mut limiter = InvokerConcurrencyLimiter::new(
+            Concurrency::new(Some(one)),
+            resolver(),
+            lane_resolver(),
+            SlotShares::new(Some(one), true),
+            8,
+        );
+        let held = limiter
+            .poll_acquire(&mut cx, holder, &g, &s_root, false)
+            .expect("slot");
+        assert!(limiter.poll_acquire(&mut cx, start, &g, &s_root, true).is_none());
+        assert!(limiter.poll_acquire(&mut cx, child, &g, &s_child, false).is_none());
+        drop(held);
+        assert!(matches!(limiter.poll_head(&mut cx), Poll::Ready(Some(h)) if h == child));
+        assert!(
+            matches!(limiter.poll_head(&mut cx), Poll::Pending),
+            "one permit, one wake: the new start is not woken for it"
+        );
+        assert!(limiter.poll_acquire(&mut cx, child, &g, &s_child, false).is_some());
     }
 
     /// Burst guard: with in-flight work always waiting, a parked new start

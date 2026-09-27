@@ -180,6 +180,15 @@ impl Permit {
         }
     }
 
+    /// Number of permit units held (`usize::MAX` when unlimited).
+    pub fn units(&self) -> usize {
+        match self.inner {
+            Permits::Unlimited => usize::MAX,
+            Permits::Empty => 0,
+            Permits::Limited(n) => n.get() as usize,
+        }
+    }
+
     /// Merges the given `other` permit into `self`.
     pub fn merge(&mut self, mut other: Self) {
         // Makes sure other's drop doesn't change the underlying semaphore
