@@ -57,6 +57,9 @@ struct Held {
     active: Duration,
     /// The chain took its invoker slot in this segment (counts as running).
     started: bool,
+    /// Probe tag from the chain's first admission (non-zero: started during
+    /// a low-load probe, so its time re-measures the baseline).
+    probe_tag: u64,
 }
 
 struct Waiters {
@@ -142,7 +145,7 @@ impl ChainAdmission {
         // downstream, and gating it would make it wait behind its own cap.
         // The overshoot is bounded by the chains in flight and drains as they end.
         let top_up = !first_run && !self.held.contains_key(&entry_id);
-        if self.node.try_admit(&key, top_up, now) {
+        if let Some(probe_tag) = self.node.try_admit(&key, top_up, now) {
             self.remove_waiter(vqueue, &key);
             match self.held.get_mut(&entry_id) {
                 // back from an external wait: the clock restarts
@@ -158,6 +161,7 @@ impl ChainAdmission {
                             segment_started: Some(now),
                             active: Duration::ZERO,
                             started: false,
+                            probe_tag,
                         },
                     );
                 }
@@ -308,7 +312,7 @@ impl ChainAdmission {
                     self.wake_local(&key, now, &mut woken);
                 }
                 if completed && active <= self.node.sample_max() {
-                    let outcome = self.node.sample(&key, active, now);
+                    let outcome = self.node.sample(&key, active, held.probe_tag, now);
                     if outcome == UpdateOutcome::Increase {
                         self.wake_local(&key, now, &mut woken);
                     }

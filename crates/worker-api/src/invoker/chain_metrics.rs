@@ -23,3 +23,4 @@ pub const CHAIN_DRIFT_DECAY_TOTAL: &str = "restate.chain_admission.drift_decay.t
 pub const CHAIN_SAMPLES_TOTAL: &str = "restate.chain_admission.samples.total";
 pub const CHAIN_ACTIVE_TIME_SECONDS: &str = "restate.chain_admission.active_time.seconds";
 pub const CHAIN_WAITERS: &str = "restate.chain_admission.waiters";
+pub const CHAIN_PROBES_TOTAL: &str = "restate.chain_admission.probes.total";

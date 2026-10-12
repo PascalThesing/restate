@@ -328,6 +328,16 @@ impl Gradient2Controller {
         self.limit
     }
 
+    /// Replaces the learned baseline with a fresh low-load measurement (see
+    /// the chain admission probe). Ends the warm-up and drops any pending
+    /// window, so the next update compares against this value.
+    pub fn reset_baseline(&mut self, baseline_ms: f64) {
+        self.long_ema = baseline_ms.max(0.1);
+        self.warmup_count = WARMUP_SAMPLES;
+        self.window_sum = 0.0;
+        self.window_count = 0;
+    }
+
     #[cfg(test)]
     pub fn long_ema(&self) -> f64 {
         self.long_ema
