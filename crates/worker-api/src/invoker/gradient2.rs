@@ -133,6 +133,10 @@ pub struct Gradient2Controller {
     warmup_sum: f64,
     last_update: Instant,
     last_sample: Instant,
+    /// Samples since the last limit update, folded into the baseline as one
+    /// mean per update (see `on_sample`).
+    window_sum: f64,
+    window_count: u32,
 
 }
 
@@ -184,6 +188,8 @@ impl Gradient2Controller {
             warmup_sum: 0.0,
             last_update: now,
             last_sample: now,
+            window_sum: 0.0,
+            window_count: 0,
         };
         controller.emit_state_gauges(1.0);
         controller
@@ -225,19 +231,20 @@ impl Gradient2Controller {
         let sample_ms = (hold.as_secs_f64() * 1000.0).max(0.1);
         self.last_sample = now;
 
-        // Baseline: arithmetic warm-up, then a time-constant EMA (rate
-        // independent — sample rates differ wildly across rules).
+        // Baseline: arithmetic warm-up, then a time-constant EMA. After the
+        // warm-up, samples are collected per update interval and folded in as
+        // ONE mean per update, weighted by the time that actually passed. The
+        // time constant then holds at any sample rate. (Weighting every sample
+        // by the time since the last update made the "120 s" baseline track
+        // within ~2 s at 100 samples/s, so a gradual slowdown was absorbed
+        // into "normal" and the limit never contracted.)
         if self.warmup_count < WARMUP_SAMPLES {
             self.warmup_count += 1;
             self.warmup_sum += sample_ms;
             self.long_ema = self.warmup_sum / self.warmup_count as f64;
         } else {
-            let dt = now
-                .saturating_duration_since(self.last_update)
-                .as_secs_f64()
-                .max(0.001);
-            let alpha = 1.0 - (-dt / LONG_EMA_TIME_CONSTANT.as_secs_f64()).exp();
-            self.long_ema += alpha * (sample_ms - self.long_ema);
+            self.window_sum += sample_ms;
+            self.window_count += 1;
         }
 
         // Baseline drift decay: after a load spike ends, pull an inflated
@@ -251,6 +258,14 @@ impl Gradient2Controller {
         // measurable before the next one. Hot path: most samples land here.
         if now.saturating_duration_since(self.last_update) < MIN_UPDATE_INTERVAL {
             return UpdateOutcome::IntervalSkip;
+        }
+        if self.window_count > 0 {
+            let mean = self.window_sum / self.window_count as f64;
+            let dt = now.saturating_duration_since(self.last_update).as_secs_f64();
+            let alpha = 1.0 - (-dt / LONG_EMA_TIME_CONSTANT.as_secs_f64()).exp();
+            self.long_ema += alpha * (mean - self.long_ema);
+            self.window_sum = 0.0;
+            self.window_count = 0;
         }
         self.last_update = now;
         self.m_in_flight.set(in_flight as f64);
@@ -514,5 +529,27 @@ mod tests {
         let out = c.on_sample(ms(400), c.current_limit().get(), false, now);
         assert_eq!(out, UpdateOutcome::Decrease);
         assert!(c.current_limit().get() < before);
+    }
+
+    /// The baseline's time constant holds at any sample rate: 100 samples a
+    /// second for 10 s at twice the old latency move the baseline by about
+    /// 1 - e^(-10/120) ≈ 8 % of the gap, not most of the way.
+    #[tokio::test(start_paused = true)]
+    async fn baseline_time_constant_is_rate_independent() {
+        let mut now = Instant::now();
+        let mut c = controller(now);
+        drive(&mut c, &mut now, ms(100), 60);
+        let before = c.long_ema();
+        assert!((before - 100.0).abs() < 5.0, "baseline settled near 100 ms, got {before}");
+        for _ in 0..1_000 {
+            now += Duration::from_millis(10);
+            c.on_sample(ms(200), c.current_limit().get(), true, now);
+        }
+        let moved = (c.long_ema() - before) / (200.0 - before);
+        assert!(
+            moved > 0.04 && moved < 0.15,
+            "10 s at 100 samples/s should move the baseline ~8 % of the gap, moved {:.0} %",
+            moved * 100.0
+        );
     }
 }
